@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>preview</LangVersion>
+    <TieredPGO>true</TieredPGO>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <PublishAot>true</PublishAot>
+    <IsAotCompatible>true</IsAotCompatible>
+    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591;SYSLIB5003</NoWarn>
+
+    <!-- NuGet Package Metadata -->
+    <PackageId>Glacier.Cluster</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Ian Cowley</Authors>
+    <Company>Glacier High-Performance Ecosystem</Company>
+    <Description>Pure C# .NET 10 distributed computing fabric, dynamic DAG scheduler, zero-allocation Pipelines wire protocol, multiplexed P2P Arrow IPC shuffle bus, and heterogeneous hardware task placement.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/ian-cowley/Glacier.Cluster</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/ian-cowley/Glacier.Cluster.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>distributed;cluster;dag;scheduler;arrow;pipelines;zero-allocation;simd;aot;polaris;glacier</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" Condition="Exists('..\..\README.md')" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Glacier.Cluster.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Glacier.Storage" Version="1.0.1" />
+    <PackageReference Include="Glacier.Polaris" Version="1.0.20" />
+    <PackageReference Include="System.IO.Hashing" Version="10.0.12" />
+  </ItemGroup>
+</Project>
