@@ -19,37 +19,6 @@
   <img src="assets/architecture.jpg" alt="Glacier.Cluster Architecture Blueprint" width="100%" />
 </p>
 
-```
-                               ┌──────────────────────────────────────────────┐
-                               │             ClusterCoordinator               │
-                               │  - StageCompiler & Dynamic DAG Engine        │
-                               │  - Vectorized TwoPhaseScheduler (SIMD/GPU)   │
-                               │  - PhiAccrualFailureDetector                 │
-                               └──────────────────────┬───────────────────────┘
-                                                      │ Heartbeats & Task Dispatches
-                         ┌────────────────────────────┼────────────────────────────┐
-                         ▼                            ▼                            ▼
-             ┌─────────────────────────┐  ┌─────────────────────────┐  ┌─────────────────────────┐
-             │      ClusterWorker      │  │      ClusterWorker      │  │      ClusterWorker      │
-             │       Node 1 (GPU)      │  │      Node 2 (SIMD)      │  │      Node 3 (SIMD)      │
-             │                         │  │                         │  │                         │
-             │  ┌───────────────────┐  │  │  ┌───────────────────┐  │  │  ┌───────────────────┐  │
-             │  │ArrowShuffleServer │  │  │  │ArrowShuffleServer │  │  │  │ArrowShuffleServer │  │
-             │  └─────────▲─────────┘  │  │  └─────────▲─────────┘  │  │  └─────────▲─────────┘  │
-             │            │            │  │            │            │  │            │            │
-             │  ┌─────────▼─────────┐  │  │  ┌─────────▼─────────┐  │  │  ┌─────────▼─────────┐  │
-             │  │ArrowShuffleClient │  │  │  │ArrowShuffleClient │  │  │  │ArrowShuffleClient │  │
-             │  └───────────────────┘  │  │  └───────────────────┘  │  │  └───────────────────┘  │
-             │                         │  │                         │  │                         │
-             │  ┌───────────────────┐  │  │  ┌───────────────────┐  │  │  ┌───────────────────┐  │
-             │  │ DiskSpillManager  │  │  │  │ DiskSpillManager  │  │  │  │ DiskSpillManager  │  │
-             │  └───────────────────┘  │  │  └───────────────────┘  │  │  └───────────────────┘  │
-             └────────────┬────────────┘  └────────────┬────────────┘  └────────────┬────────────┘
-                          │                            │                            │
-                          └──────────────── P2P Direct Arrow IPC ───────────────────┘
-                                     Zero-Copy Memory Exchanges (TCP)
-```
-
 ---
 
 ## ⚡ Key Capabilities
@@ -186,7 +155,7 @@ Verified clean by automated AST security scanners:
 ```bash
 python scripts/security_check.py Glacier.Cluster
 ```
-*Result: 118 files scanned, 0 potential secrets detected.*
+*Result: 123 files scanned, 0 potential secrets detected.*
 
 ---
 
