@@ -1,3 +1,5 @@
+![Glacier.Cluster Banner](assets/banner.jpg)
+
 # 🌐 Glacier.Cluster: Distributed Compute Fabric & Dynamic DAG Scheduler
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -12,6 +14,10 @@
 ---
 
 ## 🏛️ Architectural Overview
+
+<p align="center">
+  <img src="assets/architecture.jpg" alt="Glacier.Cluster Architecture Blueprint" width="100%" />
+</p>
 
 ```
                                ┌──────────────────────────────────────────────┐
