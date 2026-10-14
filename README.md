@@ -159,6 +159,12 @@ python scripts/security_check.py Glacier.Cluster
 
 ---
 
+## Credits
+
+Developed by **Ian Cowley** and **Antigravity (Google DeepMind)**.
+
+---
+
 ## 📄 License
 
-Licensed under the [MIT License](LICENSE).
+Licensed under the [MIT License](LICENSE). Copyright (c) 2026 Ian Cowley.
