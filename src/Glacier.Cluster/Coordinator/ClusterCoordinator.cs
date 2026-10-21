@@ -520,6 +520,15 @@ public sealed class ClusterCoordinator : IAsyncDisposable, IDisposable
                 if (_listener == null) break;
                 Socket socket = await _listener.AcceptSocketAsync(ct).ConfigureAwait(false);
                 socket.NoDelay = true;
+                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                if (OperatingSystem.IsWindows() || OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
+                {
+                    socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 5);
+                    socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 1);
+                    socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 5);
+                }
+                socket.ReceiveTimeout = 120_000;
+                socket.SendTimeout = 120_000;
                 _ = Task.Run(async () =>
                 {
                     await using var pipe = new SocketDuplexPipe(socket);

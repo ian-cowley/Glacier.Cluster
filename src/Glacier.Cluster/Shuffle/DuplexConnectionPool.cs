@@ -405,6 +405,14 @@ public sealed class DuplexConnectionPool : IAsyncDisposable, IDisposable
             NoDelay = true
         };
         socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+        if (OperatingSystem.IsWindows() || OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
+        {
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 5);
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 1);
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 5);
+        }
+        socket.ReceiveTimeout = 120_000;
+        socket.SendTimeout = 120_000;
 
         await socket.ConnectAsync(endPoint, ct).ConfigureAwait(false);
         return new SocketDuplexPipe(socket);

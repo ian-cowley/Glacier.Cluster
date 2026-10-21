@@ -57,6 +57,12 @@ public sealed class ArrowShuffleServer : IAsyncDisposable, IDisposable
         _listener = new TcpListener(IPAddress.Any, _requestedPort);
         _listener.Server.NoDelay = true;
         _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+        if (OperatingSystem.IsWindows() || OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
+        {
+            _listener.Server.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 5);
+            _listener.Server.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 1);
+            _listener.Server.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 5);
+        }
         _listener.Start();
 
         _actualPort = (ushort)((IPEndPoint)_listener.LocalEndpoint).Port;
@@ -71,6 +77,15 @@ public sealed class ArrowShuffleServer : IAsyncDisposable, IDisposable
             {
                 Socket socket = await _listener!.AcceptSocketAsync(ct).ConfigureAwait(false);
                 socket.NoDelay = true;
+                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                if (OperatingSystem.IsWindows() || OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
+                {
+                    socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 5);
+                    socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 1);
+                    socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 5);
+                }
+                socket.ReceiveTimeout = 120_000;
+                socket.SendTimeout = 120_000;
 
                 _ = Task.Run(async () =>
                 {
