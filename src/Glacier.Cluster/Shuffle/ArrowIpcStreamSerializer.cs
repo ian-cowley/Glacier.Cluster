@@ -2,7 +2,7 @@ namespace Glacier.Cluster.Shuffle;
 
 using System;
 using System.IO;
-using Glacier.Storage.Arrow;
+using Glacier.Formats.Arrow;
 
 /// <summary>
 /// High-performance pure C# serializer converting <see cref="ArrowRecordBatch"/> instances into

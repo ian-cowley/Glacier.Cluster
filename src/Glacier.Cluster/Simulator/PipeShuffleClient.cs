@@ -7,7 +7,7 @@ using System.Threading.Tasks;
 using Glacier.Cluster.Protocol;
 using Glacier.Cluster.Shuffle;
 using Glacier.Polaris;
-using Glacier.Storage.Arrow;
+using Glacier.Formats.Arrow;
 
 /// <summary>
 /// Mode A Shuffle Client: Executes complete wire protocol over in-process DuplexPipes without sockets.

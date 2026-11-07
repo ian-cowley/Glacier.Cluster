@@ -14,7 +14,7 @@
 
     <!-- NuGet Package Metadata -->
     <PackageId>Glacier.Cluster</PackageId>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
     <Description>Pure C# .NET 10 distributed computing fabric, dynamic DAG scheduler, zero-allocation Pipelines wire protocol, multiplexed P2P Arrow IPC shuffle bus, and heterogeneous hardware task placement.</Description>
@@ -34,9 +34,19 @@
     <InternalsVisibleTo Include="Glacier.Cluster.Tests" />
   </ItemGroup>
 
+  <ItemGroup Condition="Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') and '$(UseLocalProjectReferences)' != 'false'">
+    <ProjectReference Include="../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj" />
+    <ProjectReference Include="../../../Glacier.Polaris/src/Glacier.Polaris/Glacier.Polaris.csproj" />
+    <ProjectReference Include="../../../Glacier.Inference/src/Glacier.Inference/Glacier.Inference.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="!Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') or '$(UseLocalProjectReferences)' == 'false'">
+    <PackageReference Include="Glacier.Formats" Version="1.0.0" />
+    <PackageReference Include="Glacier.Polaris" Version="1.2.0" />
+    <PackageReference Include="Glacier.Inference" Version="1.4.0" />
+  </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="Glacier.Storage" Version="1.0.2" />
-    <PackageReference Include="Glacier.Polaris" Version="1.1.0" />
     <PackageReference Include="System.IO.Hashing" Version="10.0.12" />
+    <PackageReference Include="System.Numerics.Tensors" Version="10.0.12" />
+    <PackageReference Include="System.Security.Cryptography.Pkcs" Version="10.0.14" />
   </ItemGroup>
 </Project>

@@ -5,7 +5,7 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
-using Glacier.Storage.Arrow;
+using Glacier.Formats.Arrow;
 
 /// <summary>
 /// Zero-allocation, pure C# reader deserializing <see cref="ArrowRecordBatch"/> instances directly

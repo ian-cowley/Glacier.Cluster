@@ -4,7 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Glacier.Cluster.Scheduler.LogicalPlan;
-using Glacier.Storage.Arrow;
+using Glacier.Formats.Arrow;
 
 /// <summary>
 /// Fluent aggregation builder coordinating two-stage map-shuffle-reduce operations

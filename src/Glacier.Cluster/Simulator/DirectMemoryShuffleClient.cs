@@ -6,7 +6,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Cluster.Shuffle;
 using Glacier.Polaris;
-using Glacier.Storage.Arrow;
+using Glacier.Formats.Arrow;
 
 /// <summary>
 /// Mode B Shuffle Client: Directly fetches and retains unmanaged RefCountedPartitionBuffers

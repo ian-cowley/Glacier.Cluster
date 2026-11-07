@@ -17,7 +17,7 @@ using Glacier.Cluster.Protocol;
 using Glacier.Cluster.Shuffle;
 using Glacier.Polaris;
 using Glacier.Polaris.Data;
-using Glacier.Storage.Arrow;
+using Glacier.Formats.Arrow;
 using Glacier.Cluster.Coordinator;
 using Glacier.Cluster.Worker;
 using Glacier.Cluster.Scheduler;

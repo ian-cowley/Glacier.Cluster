@@ -12,7 +12,7 @@ using Glacier.Polaris;
 using Glacier.Polaris.Data;
 using Glacier.Polaris.IO;
 using Glacier.Polaris.Memory;
-using Glacier.Storage.Arrow;
+using Glacier.Formats.Arrow;
 
 /// <summary>
 /// High-performance zero-copy bridge between <see cref="DataFrame"/> and Arrow RecordBatches /

@@ -22,7 +22,7 @@ using Glacier.Cluster.Shuffle;
 using Glacier.Cluster.Worker;
 using Glacier.Polaris;
 using Glacier.Polaris.Data;
-using Glacier.Storage.Arrow;
+using Glacier.Formats.Arrow;
 using Xunit;
 
 public sealed class Milestone4ChallengerTests

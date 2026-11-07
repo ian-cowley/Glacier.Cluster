@@ -8,6 +8,7 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <IsPackable>false</IsPackable>
     <ServerGarbageCollection>false</ServerGarbageCollection>
+    <NoWarn>$(NoWarn);CS0105</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -15,6 +16,11 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+    <PackageReference Include="System.Security.Cryptography.Pkcs" Version="10.0.14" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 
   <ItemGroup>
@@ -23,5 +29,15 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Glacier.Cluster\Glacier.Cluster.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') and '$(UseLocalProjectReferences)' != 'false'">
+    <ProjectReference Include="../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj" />
+    <ProjectReference Include="../../../Glacier.Polaris/src/Glacier.Polaris/Glacier.Polaris.csproj" />
+    <ProjectReference Include="../../../Glacier.Inference/src/Glacier.Inference/Glacier.Inference.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="!Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') or '$(UseLocalProjectReferences)' == 'false'">
+    <PackageReference Include="Glacier.Formats" Version="1.0.0" />
+    <PackageReference Include="Glacier.Polaris" Version="1.2.0" />
+    <PackageReference Include="Glacier.Inference" Version="1.4.0" />
   </ItemGroup>
 </Project>

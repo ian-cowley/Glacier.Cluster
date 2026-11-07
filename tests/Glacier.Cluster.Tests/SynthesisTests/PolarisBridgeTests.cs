@@ -6,7 +6,7 @@ using Glacier.Cluster.Polaris;
 using Glacier.Cluster.Shuffle;
 using Glacier.Polaris;
 using Glacier.Polaris.Data;
-using Glacier.Storage.Arrow;
+using Glacier.Formats.Arrow;
 using Xunit;
 
 public sealed class PolarisBridgeTests

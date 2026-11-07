@@ -13,7 +13,7 @@ using System.Threading.Tasks;
 using Glacier.Cluster.Protocol;
 using Glacier.Polaris;
 using Glacier.Polaris.IO;
-using Glacier.Storage.Arrow;
+using Glacier.Formats.Arrow;
 
 /// <summary>
 /// Interface for pulling partitions, Arrow IPC record batches, and DataFrames from remote shuffle servers.

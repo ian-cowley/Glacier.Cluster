@@ -7,7 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Cluster.Shuffle;
 using Glacier.Polaris;
-using Glacier.Storage.Arrow;
+using Glacier.Formats.Arrow;
 
 /// <summary>
 /// Shuffle client proxy injecting deterministic partition fetch failures and simulated data loss.

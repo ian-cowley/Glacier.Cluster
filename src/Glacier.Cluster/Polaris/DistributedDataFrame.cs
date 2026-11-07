@@ -10,7 +10,7 @@ using Glacier.Cluster.Scheduler;
 using Glacier.Cluster.Scheduler.LogicalPlan;
 using Glacier.Cluster.Shuffle;
 using Glacier.Polaris;
-using Glacier.Storage.Arrow;
+using Glacier.Formats.Arrow;
 
 /// <summary>
 /// Columnar distributed dataframe abstraction partitioned across cluster workers.
