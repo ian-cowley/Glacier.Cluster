@@ -163,4 +163,51 @@ public sealed class ClusterDaemonTests
 
         await worker.StopAsync();
     }
+
+    [Fact]
+    public async Task ClusterCoordinator_And_ClusterWorker_PhysicalTcpJoin_AuthAndShufflePortPropagation()
+    {
+        string testAuthToken = Guid.NewGuid().ToString("N");
+        await using var coordinator = new ClusterCoordinator(new ClusterCoordinatorOptions
+        {
+            BindAddress = IPAddress.Loopback,
+            Port = 0,
+            ClusterSecret = testAuthToken
+        });
+        await coordinator.StartAsync();
+        Assert.True(coordinator.Port > 0);
+
+        // 1. Mismatched secret must be rejected over physical TCP
+        await using var unauthorizedWorker = new ClusterWorker(new ClusterWorkerOptions
+        {
+            CoordinatorEndPoint = new IPEndPoint(IPAddress.Loopback, coordinator.Port),
+            Hostname = "unauth-worker",
+            ShufflePort = 0,
+            ClusterSecret = "wrong-" + Guid.NewGuid().ToString("N")
+        });
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => unauthorizedWorker.StartAsync());
+        Assert.Equal(0, coordinator.Membership.ActiveNodeCount);
+
+        // 2. Matching secret succeeds, stays connected over TCP, and propagates dynamic ShufflePort
+        await using var authorizedWorker = new ClusterWorker(new ClusterWorkerOptions
+        {
+            CoordinatorEndPoint = new IPEndPoint(IPAddress.Loopback, coordinator.Port),
+            Hostname = "tcp-worker",
+            ShufflePort = 0,
+            ClusterSecret = testAuthToken
+        });
+
+        await authorizedWorker.StartAsync();
+        Assert.True(authorizedWorker.IsRunning);
+        Assert.True(authorizedWorker.ShufflePort > 0);
+        Assert.Equal(0, authorizedWorker.AssignedRank);
+        Assert.Equal(1, coordinator.Membership.ActiveNodeCount);
+
+        Assert.True(coordinator.Membership.TryGetNode(authorizedWorker.NodeId, out var registeredNode));
+        Assert.NotNull(registeredNode);
+        Assert.Equal(authorizedWorker.ShufflePort, registeredNode!.ShufflePort);
+
+        await authorizedWorker.StopAsync();
+    }
 }

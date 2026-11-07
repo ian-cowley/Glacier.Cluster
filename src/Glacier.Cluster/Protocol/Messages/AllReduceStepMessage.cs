@@ -88,12 +88,11 @@ public sealed class AllReduceStepMessage : IClusterMessage<AllReduceStepMessage>
         byte phase = source[20];
         int chunkIndex = BinaryPrimitives.ReadInt32LittleEndian(source.Slice(24, 4));
         int elementCount = BinaryPrimitives.ReadInt32LittleEndian(source.Slice(28, 4));
+        if (elementCount < 0 || elementCount > (source.Length - HeaderSize) / sizeof(float))
+            throw new ArgumentException($"Source span too small for float payload count {elementCount} (available bytes: {source.Length - HeaderSize}).", nameof(source));
 
         int dataBytes = elementCount * sizeof(float);
-        if (source.Length < HeaderSize + dataBytes)
-            throw new ArgumentException($"Source span too small for float payload. Expected {HeaderSize + dataBytes}, got {source.Length}.", nameof(source));
-
-        float[] floats = new float[elementCount];
+        float[] floats = elementCount > 0 ? new float[elementCount] : Array.Empty<float>();
         if (elementCount > 0)
         {
             Span<byte> destBytes = MemoryMarshal.AsBytes(floats.AsSpan());

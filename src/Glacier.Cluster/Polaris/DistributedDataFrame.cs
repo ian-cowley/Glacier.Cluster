@@ -151,17 +151,18 @@ public sealed class DistributedDataFrame : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Repartitions the distributed dataframe into a different partition count.
+    /// Repartitions the distributed dataframe into a different partition count via hash or round-robin routing.
     /// </summary>
     public DistributedDataFrame Repartition(int targetPartitions, params string[]? partitionKeys)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(targetPartitions);
+        var plan = new LogicalRepartitionNode(LogicalPlan, targetPartitions, partitionKeys);
         return new DistributedDataFrame(
             Guid.NewGuid(),
             $"{Name}_Repartition",
             Schema,
             targetPartitions,
-            LogicalPlan,
+            plan,
             ExecutionContext);
     }
 
@@ -245,12 +246,32 @@ public sealed class DistributedDataFrame : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Writes distributed partitions to Parquet or Arrow IPC stream.
+    /// Writes the distributed dataframe as a genuine Apache Parquet file via Glacier.Polaris.
     /// </summary>
     public async ValueTask WriteParquetAsync(string clusterPath, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(clusterPath);
         var df = await CollectAsync(cancellationToken).ConfigureAwait(false);
+        string? directory = Path.GetDirectoryName(clusterPath);
+        if (!string.IsNullOrEmpty(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+        df.WriteParquet(clusterPath);
+    }
+
+    /// <summary>
+    /// Writes the distributed dataframe as an Arrow IPC stream file.
+    /// </summary>
+    public async ValueTask WriteArrowIpcAsync(string clusterPath, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(clusterPath);
+        var df = await CollectAsync(cancellationToken).ConfigureAwait(false);
+        string? directory = Path.GetDirectoryName(clusterPath);
+        if (!string.IsNullOrEmpty(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
         using var fs = File.Create(clusterPath);
         df.ToArrowIpc(fs, leaveOpen: false);
     }

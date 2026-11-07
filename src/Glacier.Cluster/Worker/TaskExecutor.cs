@@ -319,6 +319,46 @@ public sealed class TaskExecutor : IDisposable
                     break;
                 }
 
+                case StageOperatorType.Custom:
+                {
+                    string customPayload = Encoding.UTF8.GetString(payload.Span);
+                    if (customPayload.StartsWith("REPARTITION:", StringComparison.Ordinal))
+                    {
+                        string[] parts = customPayload.Split(':', 3);
+                        int targetPartitions = int.TryParse(parts[1], out int tp) && tp > 0 ? tp : 1;
+                        string[] keys = parts.Length > 2 && !string.IsNullOrWhiteSpace(parts[2])
+                            ? parts[2].Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+                            : Array.Empty<string>();
+
+                        var dfs = new List<DataFrame>(upstreams.Length);
+                        foreach (var b in upstreams)
+                        {
+                            if (b != null && b.ByteLength > 0)
+                            {
+                                dfs.Add(PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: false));
+                            }
+                        }
+
+                        var combinedDf = dfs.Count == 1
+                            ? dfs[0]
+                            : (dfs.Count > 1
+                                ? (dfs.All(d => d.RowCount == 0) ? (dfs.FirstOrDefault(d => d.Columns.Count > 0) ?? new DataFrame()) : DataFrame.Concat(dfs))
+                                : new DataFrame());
+
+                        var buckets = InMemoryDistributedExecutionContext.RepartitionDataFrame(combinedDf, targetPartitions, keys);
+                        resultDf = partitionId >= 0 && partitionId < buckets.Count
+                            ? buckets[partitionId]
+                            : (combinedDf.Columns.Count > 0 ? new DataFrame(combinedDf.Columns.Select(c => c.CloneEmpty(0)).ToList()) : new DataFrame());
+                    }
+                    else
+                    {
+                        resultDf = upstreams[0].ByteLength > 0
+                            ? PolarisBridge.PartitionBufferToDataFrame(upstreams[0], zeroCopy: false)
+                            : new DataFrame();
+                    }
+                    break;
+                }
+
                 default:
                 {
                     resultDf = upstreams[0].ByteLength > 0
@@ -337,16 +377,88 @@ public sealed class TaskExecutor : IDisposable
             throw new InvalidOperationException($"Stage operator '{operatorType}' requires upstream input partitions to execute.");
         }
 
-        // 2. Raw unmanaged partition buffer path (Scan)
-        int defaultBufferSize = Math.Max(1024, payload.Length);
-        var buffer = RefCountedPartitionBuffer.Allocate(defaultBufferSize);
+        return ExecuteFileScanAsync(partitionId, payload, cancellationToken);
+    }
 
-        if (!payload.IsEmpty && payload.Length <= buffer.Span.Length)
+    private static async ValueTask<(RefCountedPartitionBuffer Buffer, ulong RowCount)> ExecuteFileScanAsync(
+        int partitionId,
+        ReadOnlyMemory<byte> payload,
+        CancellationToken cancellationToken)
+    {
+        if (payload.IsEmpty)
         {
-            payload.Span.CopyTo(buffer.Span);
+            throw new InvalidOperationException("Scan operator requires a non-empty data source URI or file path.");
         }
 
-        return ValueTask.FromResult((buffer, 100UL));
+        string payloadStr = Encoding.UTF8.GetString(payload.Span);
+        string[] parts = payloadStr.Split('|');
+        string rawUri = parts[0].Trim();
+        var filterPredicates = parts.Skip(1).Where(p => !string.IsNullOrEmpty(p)).ToList();
+
+        string localPath = rawUri;
+        if (rawUri.StartsWith("file://", StringComparison.OrdinalIgnoreCase) &&
+            Uri.TryCreate(rawUri, UriKind.Absolute, out var parsedUri) &&
+            parsedUri.IsFile)
+        {
+            localPath = parsedUri.LocalPath;
+        }
+
+        if (!System.IO.File.Exists(localPath))
+        {
+            throw new System.IO.FileNotFoundException(
+                $"Scan source '{rawUri}' was not found in registered cluster sources, local partition store, or filesystem.",
+                localPath);
+        }
+
+        DataFrame scannedDf;
+        string ext = System.IO.Path.GetExtension(localPath);
+        if (ext.Equals(".parquet", StringComparison.OrdinalIgnoreCase))
+        {
+            var reader = new Glacier.Polaris.IO.ParquetReader(localPath);
+            var rowGroups = new List<DataFrame>();
+            await foreach (var rg in reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                rowGroups.Add(rg);
+            }
+            scannedDf = rowGroups.Count == 0
+                ? new DataFrame()
+                : (rowGroups.Count == 1 ? rowGroups[0] : DataFrame.Concat(rowGroups));
+        }
+        else if (ext.Equals(".csv", StringComparison.OrdinalIgnoreCase))
+        {
+            scannedDf = await DataFrame.ScanCsv(localPath).Collect().ConfigureAwait(false);
+        }
+        else if (ext.Equals(".json", StringComparison.OrdinalIgnoreCase) || ext.Equals(".ndjson", StringComparison.OrdinalIgnoreCase))
+        {
+            scannedDf = DataFrame.ReadJson(localPath);
+        }
+        else
+        {
+            byte[] rawBytes = await System.IO.File.ReadAllBytesAsync(localPath, cancellationToken).ConfigureAwait(false);
+            using var tempBuf = RefCountedPartitionBuffer.Allocate(rawBytes.Length);
+            rawBytes.CopyTo(tempBuf.Span);
+            scannedDf = PolarisBridge.PartitionBufferToDataFrame(tempBuf, zeroCopy: false);
+        }
+
+        if (partitionId > 0 && scannedDf.Columns.Count > 0)
+        {
+            scannedDf = new DataFrame(scannedDf.Columns.Select(c => c.CloneEmpty(0)).ToList());
+        }
+
+        var originalCols = scannedDf.Columns;
+        foreach (var filterPredicate in filterPredicates)
+        {
+            var expr = PredicateCompiler.Compile(filterPredicate);
+            var filteredDf = scannedDf.Filter(expr);
+            if (filteredDf.Columns.Count == 0 && originalCols.Count > 0)
+            {
+                filteredDf = new DataFrame(originalCols.Select(c => c.CloneEmpty(0)).ToList());
+            }
+            scannedDf = filteredDf;
+        }
+
+        var outBuffer = PolarisBridge.DataFrameToPartitionBuffer(scannedDf);
+        return (outBuffer, (ulong)scannedDf.RowCount);
     }
 
     private static DataFrame ExecuteFilter(DataFrame df, ReadOnlyMemory<byte> payload)

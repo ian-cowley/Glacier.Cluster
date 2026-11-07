@@ -86,7 +86,7 @@ public sealed class PartitionFetchResponseMessage : IClusterMessage<PartitionFet
         ulong chunkOffset = BinaryPrimitives.ReadUInt64LittleEndian(source.Slice(36, 8));
         int chunkLen = BinaryPrimitives.ReadInt32LittleEndian(source.Slice(44, 4));
 
-        if (chunkLen < 0 || source.Length < HeaderSize + chunkLen)
+        if (chunkLen < 0 || chunkLen > source.Length - HeaderSize)
             throw new ArgumentException("Invalid chunk payload length in PartitionFetchResponseMessage.", nameof(source));
 
         byte[] chunk = chunkLen > 0 ? source.Slice(HeaderSize, chunkLen).ToArray() : Array.Empty<byte>();

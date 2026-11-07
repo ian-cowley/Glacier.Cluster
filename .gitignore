@@ -3,6 +3,7 @@
 [Oo]bj/
 [Ll]og/
 [Ll]ogs/
+[Tt]est[Rr]esults/
 BenchmarkDotNet.Artifacts/
 dist/
 publish/
@@ -21,8 +22,8 @@ nuget-local/
 # Secrets & Environment variables (Zero Secrets Policy)
 *.env
 *.env.*
-appsettings.json
-appsettings.*.json
+*.env*
+appsettings*.json
 !appsettings.template.json
 
 # Scratch and temporary testing files

@@ -8,6 +8,8 @@ using System.IO.Pipelines;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Cluster.Protocol;
@@ -23,6 +25,7 @@ public sealed class ClusterCoordinatorOptions
     public TimeSpan HeartbeatAuditInterval { get; init; } = TimeSpan.FromMilliseconds(500);
     public int MaxTaskRetries { get; init; } = 3;
     public bool EnableConsensusReplication { get; init; } = false;
+    public bool DisableSocketListener { get; init; } = false;
 }
 
 /// <summary>
@@ -39,6 +42,7 @@ public sealed class ClusterCoordinator : IAsyncDisposable, IDisposable
 
     private readonly ConcurrentDictionary<Guid, ActiveJobContext> _activeJobs = new();
     private readonly ConcurrentDictionary<Guid, DuplexConnection> _workerConnections = new();
+    private readonly ConcurrentDictionary<Guid, EndPoint> _workerEndPoints = new();
     private readonly ConcurrentDictionary<Guid, UpstreamPartitionRegistry> _jobPartitionLocations = new();
 
     private TcpListener? _listener;
@@ -53,6 +57,11 @@ public sealed class ClusterCoordinator : IAsyncDisposable, IDisposable
     public MembershipManager Membership => _membershipManager;
     public ActiveStandbyConsensusLedger? ConsensusLedger => _consensusLedger;
     public bool IsActiveLeader => _consensusLedger == null || _consensusLedger.CurrentRole == ConsensusRole.Active;
+
+    public ClusterCoordinator(ushort port)
+        : this(new ClusterCoordinatorOptions { Port = port })
+    {
+    }
 
     public ClusterCoordinator(
         ClusterCoordinatorOptions? options = null,
@@ -78,18 +87,24 @@ public sealed class ClusterCoordinator : IAsyncDisposable, IDisposable
             await _consensusLedger.StartAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        try
+        if (_options.DisableSocketListener)
         {
-            _listener = new TcpListener(_options.BindAddress, _options.Port);
-            _listener.Server.NoDelay = true;
-            _listener.Start();
-            Port = (ushort)((IPEndPoint)_listener.LocalEndpoint).Port;
-            _acceptLoopTask = Task.Run(() => AcceptLoopAsync(_cts.Token));
-        }
-        catch (SocketException)
-        {
-            // If socket binding fails (e.g. port conflict or restricted environment), fallback to in-process only
             Port = _options.Port;
+        }
+        else
+        {
+            try
+            {
+                _listener = new TcpListener(_options.BindAddress, _options.Port);
+                _listener.Server.NoDelay = true;
+                _listener.Start();
+                Port = (ushort)((IPEndPoint)_listener.LocalEndpoint).Port;
+                _acceptLoopTask = Task.Run(() => AcceptLoopAsync(_cts.Token));
+            }
+            catch (SocketException) when (_options.Port == 0)
+            {
+                Port = 0;
+            }
         }
 
         _healthAuditLoopTask = Task.Run(() => HealthAuditLoopAsync(_cts.Token));
@@ -226,16 +241,54 @@ public sealed class ClusterCoordinator : IAsyncDisposable, IDisposable
         {
             case NodeJoinRequestMessage joinRequest:
             {
+                if (!string.IsNullOrEmpty(_options.ClusterSecret))
+                {
+                    byte[] expectedBytes = Encoding.UTF8.GetBytes(_options.ClusterSecret);
+                    byte[] providedBytes = Encoding.UTF8.GetBytes(joinRequest.ClusterSecret ?? string.Empty);
+                    if (!CryptographicOperations.FixedTimeEquals(expectedBytes, providedBytes))
+                    {
+                        var rejected = new NodeJoinResponseMessage(
+                            status: NodeJoinStatus.Unauthorized,
+                            assignedNodeId: Guid.Empty,
+                            assignedRank: -1,
+                            activeClusterSize: _membershipManager.ActiveNodeCount,
+                            clusterEpoch: _membershipManager.ClusterEpoch,
+                            rejectionReason: "Invalid cluster authentication secret.");
+
+                        if (_workerConnections.TryGetValue(senderNodeId, out var unauthConn))
+                        {
+                            byte[] rejBuf = new byte[rejected.GetByteCount() + ClusterFrameHeader.HeaderSize];
+                            ClusterMessageSerializer.PackFrame(rejected, frame.Header.CorrelationId, ClusterFrameFlags.None, rejBuf);
+                            await unauthConn.SendRawFrameAsync(rejBuf).ConfigureAwait(false);
+                        }
+                        break;
+                    }
+                }
+
                 Guid nodeId = joinRequest.HardwareProfile.NodeId != Guid.Empty
                     ? joinRequest.HardwareProfile.NodeId
                     : senderNodeId;
 
-                var ack = await _membershipManager.RegisterWorkerAsync(joinRequest, new IPEndPoint(IPAddress.Loopback, 0)).ConfigureAwait(false);
+                EndPoint remoteEndPoint = _workerEndPoints.TryGetValue(senderNodeId, out var trackedEp)
+                    ? trackedEp
+                    : new IPEndPoint(IPAddress.Loopback, 0);
+
+                var ack = await _membershipManager.RegisterWorkerAsync(
+                    joinRequest,
+                    remoteEndPoint,
+                    joinRequest.ShufflePort).ConfigureAwait(false);
 
                 // If connection was indexed by temporary ID, update to assigned ID
-                if (senderNodeId != nodeId && _workerConnections.TryRemove(senderNodeId, out var existingConn))
+                if (senderNodeId != nodeId)
                 {
-                    _workerConnections[nodeId] = existingConn;
+                    if (_workerConnections.TryRemove(senderNodeId, out var existingConn))
+                    {
+                        _workerConnections[nodeId] = existingConn;
+                    }
+                    if (_workerEndPoints.TryRemove(senderNodeId, out var existingEp))
+                    {
+                        _workerEndPoints[nodeId] = existingEp;
+                    }
                 }
 
                 if (_workerConnections.TryGetValue(nodeId, out var conn) || _workerConnections.TryGetValue(senderNodeId, out conn))
@@ -529,19 +582,22 @@ public sealed class ClusterCoordinator : IAsyncDisposable, IDisposable
                 }
                 socket.ReceiveTimeout = 120_000;
                 socket.SendTimeout = 120_000;
-                _ = Task.Run(async () =>
-                {
-                    await using var pipe = new SocketDuplexPipe(socket);
-                    Guid tempId = Guid.NewGuid();
-                    var connection = new DuplexConnection(
-                        tempId,
-                        pipe,
-                        socket,
-                        unsolicitedFrameHandler: frame => HandleInboundFrameAsync(tempId, frame));
 
-                    _workerConnections[tempId] = connection;
-                    connection.Start();
-                }, ct);
+                var pipe = new SocketDuplexPipe(socket);
+                Guid tempId = Guid.NewGuid();
+                if (socket.RemoteEndPoint != null)
+                {
+                    _workerEndPoints[tempId] = socket.RemoteEndPoint;
+                }
+
+                var connection = new DuplexConnection(
+                    tempId,
+                    pipe,
+                    socket,
+                    unsolicitedFrameHandler: frame => HandleInboundFrameAsync(tempId, frame));
+
+                _workerConnections[tempId] = connection;
+                connection.Start();
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
             catch { if (ct.IsCancellationRequested) break; }

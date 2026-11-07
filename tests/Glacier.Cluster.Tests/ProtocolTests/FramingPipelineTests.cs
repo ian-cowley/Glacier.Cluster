@@ -172,11 +172,10 @@ public sealed class FramingPipelineTests
         var header = new ClusterFrameHeader(ClusterMessageType.HeartbeatPing, 1, 64);
         header.WriteTo(frameBytes.AsSpan(0, 32));
 
-        // Warm up JIT
-        for (int i = 0; i < 100; i++)
+        // Warm up Tier-0 -> Tier-1 PGO JIT completely before measuring thread allocations
+        for (int i = 0; i < 5_000; i++)
         {
-            var seq = new ReadOnlySequence<byte>(frameBytes);
-            ClusterFrameReader.TryReadFrame(ref seq, out _, out _);
+            TryReadFrameOnce(frameBytes);
         }
 
         // Measure allocations
@@ -185,15 +184,21 @@ public sealed class FramingPipelineTests
         const int iterations = 10_000;
         for (int i = 0; i < iterations; i++)
         {
-            var seq = new ReadOnlySequence<byte>(frameBytes);
-            bool success = ClusterFrameReader.TryReadFrame(ref seq, out var h, out var p);
-            if (!success || p.Length != 64) throw new InvalidOperationException();
+            TryReadFrameOnce(frameBytes);
         }
 
         long allocatedAfter = GC.GetAllocatedBytesForCurrentThread();
         long allocatedBytes = allocatedAfter - allocatedBefore;
 
         Assert.Equal(0, allocatedBytes);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void TryReadFrameOnce(byte[] frameBytes)
+    {
+        var seq = new ReadOnlySequence<byte>(frameBytes);
+        bool success = ClusterFrameReader.TryReadFrame(ref seq, out _, out var p);
+        if (!success || p.Length != 64) throw new InvalidOperationException();
     }
 
     private sealed class TestBufferSegment<T> : ReadOnlySequenceSegment<T>

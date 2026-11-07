@@ -99,7 +99,7 @@ public sealed class ClusterWorker : IAsyncDisposable, IDisposable
         _coordinatorConnection.Start();
 
         // 3. Send Registration Request
-        var joinRequest = new NodeJoinRequestMessage(_profile, _options.Hostname, _options.ClusterSecret);
+        var joinRequest = new NodeJoinRequestMessage(_profile, _options.Hostname, _options.ClusterSecret, ShufflePort);
         ulong correlationId = Interlocked.Increment(ref _correlationIdCounter);
 
         byte[] reqBuf = new byte[joinRequest.GetByteCount() + ClusterFrameHeader.HeaderSize];

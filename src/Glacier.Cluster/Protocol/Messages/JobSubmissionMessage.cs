@@ -78,13 +78,16 @@ public sealed class JobSubmissionMessage : IClusterMessage<JobSubmissionMessage>
         string jobName = BinaryStringHelper.ReadUtf8String(source.Slice(offset), out int nameBytes);
         offset += nameBytes;
 
+        if (source.Length - offset < 20)
+            throw new ArgumentException("Source span too small for JobSubmissionMessage fields.", nameof(source));
+
         int totalStages = BinaryPrimitives.ReadInt32LittleEndian(source.Slice(offset, 4));
         uint partitions = BinaryPrimitives.ReadUInt32LittleEndian(source.Slice(offset + 4, 4));
         ulong timeoutMs = BinaryPrimitives.ReadUInt64LittleEndian(source.Slice(offset + 8, 8));
         int dagLen = BinaryPrimitives.ReadInt32LittleEndian(source.Slice(offset + 16, 4));
         offset += 20;
 
-        if (dagLen < 0 || source.Length < offset + dagLen)
+        if (dagLen < 0 || dagLen > source.Length - offset)
             throw new ArgumentException("Invalid DAG payload length in JobSubmissionMessage.", nameof(source));
 
         byte[] dag = dagLen > 0 ? source.Slice(offset, dagLen).ToArray() : Array.Empty<byte>();

@@ -163,4 +163,47 @@ public sealed class DistributedDataFrameTests
         var take10 = await ddf.TakeAsync(10);
         Assert.Equal(10, take10.RowCount);
     }
+
+    [Fact]
+    public async Task WriteParquetAsync_And_Repartition_RoundtripGenuineParquet()
+    {
+        var (partitions, expectedDf) = CreateSampleDataset(partitionCount: 2, rowsPerPartition: 15);
+        using var ddf = DistributedDataFrameFactory.FromPartitions(partitions);
+
+        var repartitioned = ddf.Repartition(4, "dept");
+        Assert.Equal(4, repartitioned.PartitionCount);
+
+        string parquetPath = System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(),
+            $"glacier_cluster_parquet_{Guid.NewGuid():N}.parquet");
+
+        try
+        {
+            await repartitioned.WriteParquetAsync(parquetPath);
+            Assert.True(System.IO.File.Exists(parquetPath));
+
+            byte[] rawBytes = await System.IO.File.ReadAllBytesAsync(parquetPath);
+            Assert.True(rawBytes.Length >= 8);
+            // Apache Parquet magic header & footer: "PAR1"
+            Assert.Equal("PAR1", System.Text.Encoding.ASCII.GetString(rawBytes, 0, 4));
+            Assert.Equal("PAR1", System.Text.Encoding.ASCII.GetString(rawBytes, rawBytes.Length - 4, 4));
+
+            var reader = new Glacier.Polaris.IO.ParquetReader(parquetPath);
+            var readGroups = new List<DataFrame>();
+            await foreach (var rg in reader.ReadAsync())
+            {
+                readGroups.Add(rg);
+            }
+            var roundtripDf = readGroups.Count == 1 ? readGroups[0] : DataFrame.Concat(readGroups);
+            Assert.Equal(expectedDf.RowCount, roundtripDf.RowCount);
+            Assert.Equal(expectedDf.Columns.Count, roundtripDf.Columns.Count);
+        }
+        finally
+        {
+            if (System.IO.File.Exists(parquetPath))
+            {
+                System.IO.File.Delete(parquetPath);
+            }
+        }
+    }
 }

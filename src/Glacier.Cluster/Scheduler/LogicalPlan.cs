@@ -110,3 +110,24 @@ public sealed class LogicalHashJoinNode : LogicalPlanNode
         TargetPartitions = targetPartitions;
     }
 }
+
+/// <summary>
+/// Repartitions or coalesces an upstream dataset into a target partition count via hash or round-robin routing.
+/// </summary>
+public sealed class LogicalRepartitionNode : LogicalPlanNode
+{
+    public override string Name => "Repartition";
+    public LogicalPlanNode Source { get; }
+    public int TargetPartitions { get; }
+    public string[] PartitionKeys { get; }
+    public override IReadOnlyList<LogicalPlanNode> Children => new[] { Source };
+    public override bool IsWideBoundary => true;
+
+    public LogicalRepartitionNode(LogicalPlanNode source, int targetPartitions, string[]? partitionKeys = null)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(targetPartitions);
+        Source = source ?? throw new ArgumentNullException(nameof(source));
+        TargetPartitions = targetPartitions;
+        PartitionKeys = partitionKeys ?? Array.Empty<string>();
+    }
+}

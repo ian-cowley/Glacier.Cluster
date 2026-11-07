@@ -197,6 +197,25 @@ public sealed class StageCompiler
                 return joinStageId;
             }
 
+            case LogicalRepartitionNode repartition:
+            {
+                int sourceStageId = CompileNode(jobId, repartition.Source, stages, defaultPartitions);
+                int repartitionStageId = _stageIdCounter++;
+                string keysStr = string.Join(",", repartition.PartitionKeys);
+                byte[] payload = Encoding.UTF8.GetBytes($"REPARTITION:{repartition.TargetPartitions}:{keysStr}");
+                var repartitionStage = new ExecutionStage(
+                    repartitionStageId,
+                    jobId,
+                    $"Repartition_{repartitionStageId}",
+                    isShuffleBoundary: true,
+                    partitionsCount: repartition.TargetPartitions,
+                    primaryOperator: StageOperatorType.Custom,
+                    operatorPayload: payload,
+                    parentStageIds: new[] { sourceStageId });
+                stages.Add(repartitionStage);
+                return repartitionStageId;
+            }
+
             default:
                 throw new NotSupportedException($"Unsupported logical plan node: {node.GetType().Name}");
         }

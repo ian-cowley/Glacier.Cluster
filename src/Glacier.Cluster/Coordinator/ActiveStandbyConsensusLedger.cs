@@ -71,7 +71,7 @@ public sealed class ActiveStandbyConsensusLedger : IAsyncDisposable, IDisposable
         }
         else
         {
-            _currentLease = new LeaderLease(Guid.Empty, 0, DateTimeOffset.MinValue);
+            _currentLease = new LeaderLease(Guid.Empty, 0, DateTimeOffset.UtcNow.Add(_options.LeaseDuration));
         }
     }
 

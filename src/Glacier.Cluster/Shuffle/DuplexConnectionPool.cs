@@ -246,6 +246,15 @@ public sealed class DuplexConnection : IAsyncDisposable, IDisposable
         }
         catch { /* Ignore pipe shutdown errors */ }
 
+        if (_duplexPipe is IAsyncDisposable asyncDisposablePipe)
+        {
+            try { await asyncDisposablePipe.DisposeAsync().ConfigureAwait(false); } catch { }
+        }
+        else if (_duplexPipe is IDisposable disposablePipe)
+        {
+            try { disposablePipe.Dispose(); } catch { }
+        }
+
         _underlyingSocket?.Dispose();
         _writeLock.Dispose();
 

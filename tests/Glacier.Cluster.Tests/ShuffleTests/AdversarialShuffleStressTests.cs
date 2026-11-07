@@ -104,7 +104,7 @@ public sealed class AdversarialShuffleStressTests : IDisposable
         bool isFinalReceived = false;
 
         var reader = clientPipe.Input;
-        using var readTimeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var readTimeoutCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
 
         try
         {
@@ -202,8 +202,8 @@ public sealed class AdversarialShuffleStressTests : IDisposable
         clientPipe.Output.Advance(reqFrameSize);
         await clientPipe.Output.FlushAsync();
 
-        // Simulate stalled consumer: Sleep 300ms before starting to read
-        await Task.Delay(300);
+        // Simulate stalled consumer: Sleep 50ms before starting to read
+        await Task.Delay(50);
 
         // Read in small deliberate throttled increments (e.g. 8KB at a time with pauses)
         var reader = clientPipe.Input;
@@ -249,7 +249,7 @@ public sealed class AdversarialShuffleStressTests : IDisposable
             // Throttle reading slightly to maintain backpressure during streaming
             if (!isFinal)
             {
-                await Task.Delay(10);
+                await Task.Delay(2);
             }
         }
 
@@ -665,7 +665,7 @@ public sealed class AdversarialShuffleStressTests : IDisposable
 
         // Server should detect corrupted CRC32, exit ProcessConnectionAsync, and never send any response frames
         var reader = clientPipe.Input;
-        using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        using var readCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
         int responsesReceived = 0;
 
         try

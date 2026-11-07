@@ -357,6 +357,37 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
                 };
             }
 
+            case Glacier.Cluster.Scheduler.LogicalPlan.LogicalRepartitionNode repartition:
+            {
+                var sourceBuffers = await ExecutePlanAsync(repartition.Source, cancellationToken).ConfigureAwait(false);
+                var dfs = new List<DataFrame>(sourceBuffers.Count);
+                try
+                {
+                    foreach (var b in sourceBuffers)
+                    {
+                        dfs.Add(PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: false));
+                    }
+                }
+                finally
+                {
+                    foreach (var b in sourceBuffers) b.Release();
+                }
+
+                var combinedDf = dfs.Count == 1
+                    ? dfs[0]
+                    : (dfs.All(df => df.RowCount == 0)
+                        ? (dfs.FirstOrDefault(df => df.Columns.Count > 0) ?? new DataFrame())
+                        : DataFrame.Concat(dfs));
+
+                var buckets = RepartitionDataFrame(combinedDf, repartition.TargetPartitions, repartition.PartitionKeys);
+                var outBuffers = new List<RefCountedPartitionBuffer>(buckets.Count);
+                foreach (var bucket in buckets)
+                {
+                    outBuffers.Add(PolarisBridge.DataFrameToPartitionBuffer(bucket));
+                }
+                return outBuffers;
+            }
+
             default:
                 throw new NotSupportedException($"Unsupported logical plan node: {node.GetType().Name}");
         }
@@ -606,6 +637,36 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
                     };
                     stageOutputs[stage.StageId] = outBuffers;
                 }
+                else if (stage.PrimaryOperator == StageOperatorType.Custom)
+                {
+                    int parentId = stage.ParentStageIds.First();
+                    var parentBuffers = stageOutputs[parentId];
+                    var dfs = parentBuffers.Select(b => PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: false)).ToList();
+                    var combinedDf = dfs.Count == 1
+                        ? dfs[0]
+                        : (dfs.All(df => df.RowCount == 0)
+                            ? (dfs.FirstOrDefault(df => df.Columns.Count > 0) ?? new DataFrame())
+                            : DataFrame.Concat(dfs));
+
+                    string payloadStr = Encoding.UTF8.GetString(stage.OperatorPayload.Span);
+                    if (payloadStr.StartsWith("REPARTITION:", StringComparison.Ordinal))
+                    {
+                        string[] parts = payloadStr.Split(':', 3);
+                        int targetPartitions = int.TryParse(parts[1], out int tp) && tp > 0 ? tp : stage.PartitionsCount;
+                        string[] keys = parts.Length > 2 && !string.IsNullOrWhiteSpace(parts[2])
+                            ? parts[2].Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+                            : Array.Empty<string>();
+                        var buckets = RepartitionDataFrame(combinedDf, targetPartitions, keys);
+                        stageOutputs[stage.StageId] = buckets.Select(PolarisBridge.DataFrameToPartitionBuffer).ToList();
+                    }
+                    else
+                    {
+                        stageOutputs[stage.StageId] = new List<RefCountedPartitionBuffer>(1)
+                        {
+                            PolarisBridge.DataFrameToPartitionBuffer(combinedDf)
+                        };
+                    }
+                }
             }
 
             var leafStage = dag.LeafStages[0];
@@ -712,6 +773,72 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
         }
 
         return new DataFrame(resultColumns);
+    }
+
+    internal static List<DataFrame> RepartitionDataFrame(DataFrame combinedDf, int targetPartitions, string[] partitionKeys)
+    {
+        var buckets = new List<DataFrame>(targetPartitions);
+        if (combinedDf.RowCount == 0 || combinedDf.Columns.Count == 0)
+        {
+            for (int p = 0; p < targetPartitions; p++)
+            {
+                buckets.Add(combinedDf.Columns.Count > 0
+                    ? new DataFrame(combinedDf.Columns.Select(c => c.CloneEmpty(0)).ToList())
+                    : new DataFrame());
+            }
+            return buckets;
+        }
+
+        var bucketIndices = new List<int>[targetPartitions];
+        for (int p = 0; p < targetPartitions; p++)
+        {
+            bucketIndices[p] = new List<int>((combinedDf.RowCount / targetPartitions) + 1);
+        }
+
+        if (partitionKeys.Length > 0)
+        {
+            var keyColumns = partitionKeys.Select(combinedDf.GetColumn).ToArray();
+            for (int row = 0; row < combinedDf.RowCount; row++)
+            {
+                var hc = new HashCode();
+                for (int k = 0; k < keyColumns.Length; k++)
+                {
+                    hc.Add(keyColumns[k].Get(row));
+                }
+                int targetBucket = (int)((uint)hc.ToHashCode() % (uint)targetPartitions);
+                bucketIndices[targetBucket].Add(row);
+            }
+        }
+        else
+        {
+            for (int row = 0; row < combinedDf.RowCount; row++)
+            {
+                bucketIndices[row % targetPartitions].Add(row);
+            }
+        }
+
+        for (int p = 0; p < targetPartitions; p++)
+        {
+            var indices = bucketIndices[p];
+            if (indices.Count == 0)
+            {
+                buckets.Add(new DataFrame(combinedDf.Columns.Select(c => c.CloneEmpty(0)).ToList()));
+            }
+            else
+            {
+                var span = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(indices);
+                var subCols = new List<ISeries>(combinedDf.Columns.Count);
+                foreach (var col in combinedDf.Columns)
+                {
+                    var subCol = Glacier.Polaris.Compute.UniqueKernels.CreateSeriesForTake(col, span);
+                    col.Take(subCol, span);
+                    subCols.Add(subCol);
+                }
+                buckets.Add(new DataFrame(subCols));
+            }
+        }
+
+        return buckets;
     }
 
     public void Dispose()

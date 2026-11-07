@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![.NET 10](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/)
-[![AOT Ready](https://img.shields.io/badge/Native%20AOT-100%25-success.svg)](https://learn.microsoft.com/en-us/dotnet/core/deploying/native-aot/)
+[![AOT Compatible](https://img.shields.io/badge/Native%20AOT-IsAotCompatible-success.svg)](https://learn.microsoft.com/en-us/dotnet/core/deploying/native-aot/)
 [![Zero Secrets](https://img.shields.io/badge/Security-Zero%20Secrets%20Audited-brightgreen.svg)](AGENTS.md)
 [![Website](https://img.shields.io/badge/Website-glaciersoftware.dev-66fcf1.svg)](https://glaciersoftware.dev/)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Support-orange.svg?logo=buy-me-a-coffee)](https://buymeacoffee.com/glaciersoftware)
@@ -45,7 +45,7 @@
 ### 4. Distributed Collectives & High-Level APIs
 - **Ring AllReduce Collective Engine**: Scatter-reduce followed by allgather across directed virtual or physical rings, achieving optimal bus bandwidth:
   $$\text{Bus Bandwidth} = \frac{2(N - 1)}{N} \cdot \frac{S}{T}$$
-- **Distributed DataFrame (`DistributedDataFrame`)**: Immutable logical plan trees supporting distributed `Filter`, `Select`, `GroupBy`, and multi-stage parallel aggregations.
+- **Distributed DataFrame (`DistributedDataFrame`)**: Immutable logical plan trees supporting distributed `Filter`, `Select`, `GroupBy`, `Join`, `Repartition`, and genuine Apache Parquet (`WriteParquetAsync`) & Arrow IPC (`WriteArrowIpcAsync`) sinks.
 - **Distributed K-Means (`DistributedKMeans`)**: Scalable, multi-node clustering with distributed centroid updates and convergence tracking.
 
 ### 5. Virtual Cluster Simulator & Fault Injection
@@ -84,22 +84,29 @@ Distributed query pipeline (`Filter` $\rightarrow$ `Select` $\rightarrow$ `Group
 ### 1. Launching a Coordinator and Worker
 
 ```csharp
+using System.Net;
 using Glacier.Cluster.Coordinator;
 using Glacier.Cluster.Worker;
 
+// Load shared cluster secret strictly from environment variables
+string clusterSecret = Environment.GetEnvironmentVariable("GLACIER_CLUSTER_SECRET") ?? string.Empty;
+
 // Start Coordinator
-var coordinator = new ClusterCoordinator(port: 51000);
+await using var coordinator = new ClusterCoordinator(new ClusterCoordinatorOptions
+{
+    BindAddress = IPAddress.Loopback,
+    Port = 51000,
+    ClusterSecret = clusterSecret
+});
 await coordinator.StartAsync();
 
 // Start Worker Node
-var workerOptions = new ClusterWorkerOptions
+await using var worker = new ClusterWorker(new ClusterWorkerOptions
 {
-    CoordinatorAddress = "127.0.0.1",
-    CoordinatorPort = 51000,
-    WorkerListenPort = 51001,
-    ShuffleListenPort = 51002
-};
-var worker = new ClusterWorker(workerOptions);
+    CoordinatorEndPoint = new IPEndPoint(IPAddress.Loopback, 51000),
+    ShufflePort = 51002,
+    ClusterSecret = clusterSecret
+});
 await worker.StartAsync();
 ```
 
@@ -128,36 +135,30 @@ Console.WriteLine($"Aggregated results: {result.RowCount} rows.");
 
 ## 🧪 Testing & Verification
 
-The test suite contains **488 rigorous tests** covering protocol framing, adversarial serialization, dynamic DAG scheduling, shuffle streaming, ring collectives, fault injection, and end-to-end integration:
+The test suite contains **490 rigorous tests** covering protocol framing, adversarial serialization, dynamic DAG scheduling, physical TCP worker handshakes, shuffle streaming, ring collectives, fault injection, and end-to-end integration:
 
 ```bash
 dotnet test tests/Glacier.Cluster.Tests/Glacier.Cluster.Tests.csproj -c Release
 ```
 
-Result:
-```
-Passed!  - Failed: 0, Passed: 488, Skipped: 0, Total: 488, Duration: 3m 19s
-```
+### Native AOT & Trim Analyzer Readiness
 
-### Native AOT Compilation
-
-`Glacier.Cluster` is fully Native AOT compliant with zero reflection and zero trim warnings:
+`Glacier.Cluster` enables `<IsAotCompatible>true</IsAotCompatible>`, `<EnableTrimAnalyzer>true</EnableTrimAnalyzer>`, and `<TreatWarningsAsErrors>true</TreatWarningsAsErrors>` across its wire framing, scheduling, consensus, and P2P Arrow IPC shuffle planes:
 
 ```bash
-dotnet publish src/Glacier.Cluster/Glacier.Cluster.csproj -c Release -r win-x64 /p:PublishAot=true
+dotnet build Glacier.Cluster.slnx -c Release
 ```
 
 ---
 
 ## 🔒 Security & Zero Secrets Policy
 
-All cluster node communications support mutual authentication, token handshake verification, and strict Zero Secrets policies. No API keys, passwords, or connection credentials are stored in code or configuration files. Remote fleet orchestration utilizes Windows Credential Manager (`FleetVault`) and Ed25519 SSH keys.
+All cluster node join handshakes enforce constant-time token verification (`CryptographicOperations.FixedTimeEquals`) when `ClusterSecret` is configured, alongside strict Zero Secrets policies. No API keys, passwords, or connection credentials are stored in code or configuration files.
 
 Verified clean by automated AST security scanners:
 ```bash
 python scripts/security_check.py Glacier.Cluster
 ```
-*Result: 123 files scanned, 0 potential secrets detected.*
 
 ---
 

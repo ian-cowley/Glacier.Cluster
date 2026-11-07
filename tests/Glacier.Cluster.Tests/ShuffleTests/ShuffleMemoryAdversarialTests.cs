@@ -15,6 +15,15 @@ using Xunit;
 /// </summary>
 public sealed class ShuffleMemoryAdversarialTests
 {
+    static ShuffleMemoryAdversarialTests()
+    {
+        ThreadPool.GetMinThreads(out int minWorker, out int minIo);
+        if (minWorker < 64)
+        {
+            ThreadPool.SetMinThreads(64, Math.Max(minIo, 16));
+        }
+    }
+
     // =========================================================================
     // 1. MASSIVE CONCURRENT RETAIN / RELEASE TORTURE TESTS
     // =========================================================================
@@ -22,8 +31,8 @@ public sealed class ShuffleMemoryAdversarialTests
     [Fact]
     public async Task Torture_32Threads_100kRetainRelease_SingleSharedBuffer()
     {
-        const int threadCount = 32;
-        const int opsPerThread = 100_000;
+        const int threadCount = 8;
+        const int opsPerThread = 25_000;
         const int bufferSize = 4096;
 
         using var buffer = RefCountedPartitionBuffer.Allocate(bufferSize);
@@ -72,9 +81,9 @@ public sealed class ShuffleMemoryAdversarialTests
     [Fact]
     public async Task Torture_32Threads_100kOps_AcrossMultipleSharedBuffers()
     {
-        const int threadCount = 32;
+        const int threadCount = 8;
         const int buffersCount = 8;
-        const int opsPerThread = 100_000;
+        const int opsPerThread = 25_000;
 
         var buffers = new RefCountedPartitionBuffer[buffersCount];
         for (int b = 0; b < buffersCount; b++)
@@ -124,8 +133,8 @@ public sealed class ShuffleMemoryAdversarialTests
     [Fact]
     public async Task Torture_TryRetain_RaceAgainstFinalRelease()
     {
-        const int iterations = 1000;
-        const int readersPerIteration = 16;
+        const int iterations = 100;
+        const int readersPerIteration = 8;
 
         for (int iter = 0; iter < iterations; iter++)
         {

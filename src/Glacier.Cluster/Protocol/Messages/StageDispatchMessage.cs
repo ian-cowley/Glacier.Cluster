@@ -85,17 +85,20 @@ public sealed class StageDispatchMessage : IClusterMessage<StageDispatchMessage>
         StageOperatorType opType = (StageOperatorType)BinaryPrimitives.ReadInt32LittleEndian(source.Slice(24, 4));
 
         int payloadLen = BinaryPrimitives.ReadInt32LittleEndian(source.Slice(28, 4));
-        if (payloadLen < 0 || source.Length < 36 + payloadLen)
+        if (payloadLen < 0 || payloadLen > source.Length - 36)
             throw new ArgumentException("Invalid operator payload length in StageDispatchMessage.", nameof(source));
 
-        byte[] payloadCopy = new byte[payloadLen];
-        source.Slice(32, payloadLen).CopyTo(payloadCopy);
+        byte[] payloadCopy = payloadLen > 0 ? source.Slice(32, payloadLen).ToArray() : Array.Empty<byte>();
         int offset = 32 + payloadLen;
 
         int upstreamCount = BinaryPrimitives.ReadInt32LittleEndian(source.Slice(offset, 4));
         offset += 4;
 
-        var upstreams = new UpstreamPartitionLocation[upstreamCount];
+        // Each UpstreamPartitionLocation requires at least 28 bytes (26 fixed + 2-byte string length prefix).
+        if (upstreamCount < 0 || upstreamCount > (source.Length - offset) / 28)
+            throw new ArgumentException("Invalid upstream partition count in StageDispatchMessage.", nameof(source));
+
+        var upstreams = upstreamCount > 0 ? new UpstreamPartitionLocation[upstreamCount] : Array.Empty<UpstreamPartitionLocation>();
         for (int i = 0; i < upstreamCount; i++)
         {
             upstreams[i] = UpstreamPartitionLocation.Deserialize(source.Slice(offset), out int locBytes);

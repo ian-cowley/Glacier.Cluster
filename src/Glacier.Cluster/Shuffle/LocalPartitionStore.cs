@@ -46,7 +46,7 @@ public sealed class PartitionEntry
     /// <summary>
     /// Atomically retains and returns the in-memory buffer if available.
     /// </summary>
-    public bool TryRetainBuffer(out RefCountedPartitionBuffer? retainedBuffer)
+    public bool TryRetainBuffer([System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out RefCountedPartitionBuffer? retainedBuffer)
     {
         lock (_syncLock)
         {
