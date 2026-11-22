@@ -13,7 +13,12 @@ public record NodeResourceProfile
     public bool IsLocal { get; init; }
     public string DeviceName { get; init; } = "";
     public bool IsGpu { get; init; }
+    public bool IsNpu { get; init; }
+    public string? NpuSidecarEndpoint { get; init; }
     public ulong VramBytes { get; init; }
+    /// <summary>
+    /// Total physical host system RAM in bytes (for UMA/NPU/CPU profiles; NPU WDDM/MCDM 50% shared cap is derived from this value).
+    /// </summary>
     public ulong SharedMemoryBytes { get; init; }
     public double EstimatedMsPerLayer { get; set; }
     public int MaxLayersCapacity { get; set; }
@@ -63,6 +68,12 @@ public record NodeResourceProfile
                 vramMultiplier = 1.0;
             }
         }
+        else if (IsNpu)
+        {
+            // Dedicated NPU sidecar (e.g., AMD XDNA 2 via FastFlowLM / Lemonade) — zero GPU VRAM contention,
+            // higher efficiency than CPU SIMD but lower bandwidth than discrete/integrated GPUs.
+            vramMultiplier = 0.65;
+        }
         else
         {
             // CPU SIMD (AVX-512 / AVX2)
@@ -81,6 +92,7 @@ public record NodeResourceProfile
     /// </summary>
     public int CalculateComfortableCapacity(ulong bytesPerLayer, int totalModelLayers)
     {
+        if (totalModelLayers <= 0) return 0;
         if (bytesPerLayer == 0) return totalModelLayers;
 
         if (IsGpu)
@@ -92,8 +104,7 @@ public record NodeResourceProfile
                 // display buffers, and activation scratchpads to guarantee 100% in-VRAM execution.
                 ulong safetyCushion = 1_500_000_000UL;
                 ulong usableVram = VramBytes > safetyCushion ? (VramBytes - safetyCushion) : 0;
-                int maxFit = (int)(usableVram / bytesPerLayer);
-                return Math.Clamp(maxFit, 0, totalModelLayers);
+                return ClampLayerCount(usableVram, bytesPerLayer, totalModelLayers);
             }
             else
             {
@@ -101,17 +112,31 @@ public record NodeResourceProfile
                 // Permit up to 75% allocation of total physical host RAM for layer weights.
                 ulong hostRam = SharedMemoryBytes > 0 ? SharedMemoryBytes : DynamicThroughputCalibrator.GetPhysicalHostRamBytes();
                 ulong usableUma = (ulong)(hostRam * 0.75);
-                int maxFit = (int)(usableUma / bytesPerLayer);
-                return Math.Clamp(maxFit, 0, totalModelLayers);
+                return ClampLayerCount(usableUma, bytesPerLayer, totalModelLayers);
             }
+        }
+        else if (IsNpu)
+        {
+            // Windows WDDM/MCDM caps NPU shared memory at ~50% of physical host RAM;
+            // reserve a 1 GB safety buffer for KV cache / runtime tiles.
+            ulong hostRam = SharedMemoryBytes > 0 ? SharedMemoryBytes : DynamicThroughputCalibrator.GetPhysicalHostRamBytes();
+            ulong npuCap = hostRam / 2;
+            ulong safetyCushion = 1_000_000_000UL;
+            ulong usableNpu = npuCap > safetyCushion ? (npuCap - safetyCushion) : 0;
+            return ClampLayerCount(usableNpu, bytesPerLayer, totalModelLayers);
         }
         else
         {
             // CPU SIMD: can hold as many layers as fit in available system RAM
             ulong osHeadroom = 8UL * 1024 * 1024 * 1024;
             ulong usableShared = SharedMemoryBytes > osHeadroom ? (SharedMemoryBytes - osHeadroom) : 0;
-            int maxFit = (int)(usableShared / bytesPerLayer);
-            return Math.Clamp(maxFit, 0, totalModelLayers);
+            return ClampLayerCount(usableShared, bytesPerLayer, totalModelLayers);
         }
+    }
+
+    private static int ClampLayerCount(ulong usableBytes, ulong bytesPerLayer, int totalModelLayers)
+    {
+        ulong maxFit = usableBytes / bytesPerLayer;
+        return (int)Math.Min(maxFit, (ulong)totalModelLayers);
     }
 }
