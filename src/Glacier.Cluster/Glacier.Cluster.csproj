@@ -14,7 +14,8 @@
 
     <!-- NuGet Package Metadata -->
     <PackageId>Glacier.Cluster</PackageId>
-    <Version>1.3.4</Version>
+    <Version>1.3.5</Version>
+    <PackageReleaseNotes>v1.3.5: Hardware-accelerated System.IO.Hashing Crc32 in ClusterCrc32, protocol/transport hardening, and aligned Formats/Inference/Polaris deps.</PackageReleaseNotes>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
     <Description>Pure C# .NET 10 distributed computing fabric, dynamic DAG scheduler, zero-allocation Pipelines wire protocol, multiplexed P2P Arrow IPC shuffle bus, and heterogeneous hardware task placement.</Description>
@@ -40,9 +41,9 @@
     <ProjectReference Include="../../../Glacier.Inference/src/Glacier.Inference/Glacier.Inference.csproj" />
   </ItemGroup>
   <ItemGroup Condition="!Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') or '$(UseLocalProjectReferences)' == 'false'">
-    <PackageReference Include="Glacier.Formats" Version="1.0.0" />
-    <PackageReference Include="Glacier.Polaris" Version="1.2.5" />
-    <PackageReference Include="Glacier.Inference" Version="1.8.2" />
+    <PackageReference Include="Glacier.Formats" Version="1.0.1" />
+    <PackageReference Include="Glacier.Polaris" Version="1.2.6" />
+    <PackageReference Include="Glacier.Inference" Version="1.10.1" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="System.IO.Hashing" Version="10.0.12" />

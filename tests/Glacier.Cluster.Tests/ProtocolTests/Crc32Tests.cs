@@ -36,4 +36,30 @@ public sealed class Crc32Tests
         Assert.Equal(crc1, crc2);
         Assert.NotEqual(0U, crc1);
     }
+
+    [Theory]
+    [InlineData(1, 0)]
+    [InlineData(7, 1)]
+    [InlineData(63, 3)]
+    [InlineData(4096, 0)]
+    [InlineData(65539, 5)]
+    public void Compute_MatchesSoftwareIeee8023AcrossSizesAndOffsets(int length, int offset)
+    {
+        byte[] buf = new byte[length + offset];
+        new Random(42 + length).NextBytes(buf);
+        ReadOnlySpan<byte> slice = buf.AsSpan(offset, length);
+
+        uint expected = 0xFFFFFFFFu;
+        for (int i = 0; i < slice.Length; i++)
+        {
+            expected ^= slice[i];
+            for (int b = 0; b < 8; b++)
+            {
+                expected = (expected & 1u) != 0 ? (expected >> 1) ^ 0xEDB88320u : (expected >> 1);
+            }
+        }
+        expected ^= 0xFFFFFFFFu;
+
+        Assert.Equal(expected, ClusterCrc32.Compute(slice));
+    }
 }

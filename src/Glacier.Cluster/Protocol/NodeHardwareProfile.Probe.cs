@@ -190,7 +190,12 @@ public partial struct NodeHardwareProfile
         public ulong ullAvailExtendedVirtual;
     }
 
+    private static readonly Lazy<(GpuBackendFlags flags, ulong vramTotal, ulong vramAvail)> s_cachedGpuProbe = new(ProbeGpusCore);
+
     private static (GpuBackendFlags flags, ulong vramTotal, ulong vramAvail) ProbeGpus()
+        => s_cachedGpuProbe.Value;
+
+    private static (GpuBackendFlags flags, ulong vramTotal, ulong vramAvail) ProbeGpusCore()
     {
         var flags = GpuBackendFlags.None;
         ulong totalVram = 0;

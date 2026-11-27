@@ -178,6 +178,23 @@ public sealed class ClusterSimulatorTests
         Assert.Equal("dept", resultDf.Columns[2].Name);
     }
 
+    [Fact]
+    public async Task DistributedQuery_ProjectWithoutDatasetColumnHint_StillProjectsSelectedColumns()
+    {
+        await using var simulator = await ClusterSimulator.CreateAsync(4);
+
+        var (partitions, singleNodeDf) = GenerateTestDataset(4, 25);
+        var ddf = simulator.CreateDataFrame(partitions, "employees");
+
+        var resultDf = await ddf.Filter("age > 30").Select("id", "dept").CollectAsync();
+        var expectedDf = singleNodeDf.Filter(Expr.Col("age") > 30).Select("id", "dept");
+
+        Assert.Equal(2, resultDf.Columns.Count);
+        Assert.Equal(expectedDf.RowCount, resultDf.RowCount);
+        Assert.Equal("id", resultDf.Columns[0].Name);
+        Assert.Equal("dept", resultDf.Columns[1].Name);
+    }
+
     [Theory]
     [InlineData(4, 50)]
     [InlineData(8, 50)]

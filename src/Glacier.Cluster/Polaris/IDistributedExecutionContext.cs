@@ -441,17 +441,7 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
                         {
                             var inBuf = buffers[i];
                             var inDf = PolarisBridge.PartitionBufferToDataFrame(inBuf, zeroCopy: false);
-                            var originalCols = inDf.Columns;
-                            foreach (var pred in filterPredicates)
-                            {
-                                var expr = PredicateCompiler.Compile(pred);
-                                var filtered = inDf.Filter(expr);
-                                if (filtered.Columns.Count == 0 && originalCols.Count > 0)
-                                {
-                                    filtered = new DataFrame(originalCols.Select(c => c.CloneEmpty(0)).ToList());
-                                }
-                                inDf = filtered;
-                            }
+                            inDf = Glacier.Cluster.Worker.TaskExecutor.ApplyFusedOperators(inDf, filterPredicates);
                             var outBuf = PolarisBridge.DataFrameToPartitionBuffer(inDf);
                             inBuf.Release();
                             buffers[i] = outBuf;
@@ -465,18 +455,14 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
                     int parentId = stage.ParentStageIds.First();
                     var parentBuffers = stageOutputs[parentId];
                     string exprStr = Encoding.UTF8.GetString(stage.OperatorPayload.Span);
-                    var expr = PredicateCompiler.Compile(exprStr);
+                    string[] ops = exprStr.Split('|', StringSplitOptions.RemoveEmptyEntries);
 
                     var outBuffers = new List<RefCountedPartitionBuffer>(parentBuffers.Count);
                     for (int i = 0; i < parentBuffers.Count; i++)
                     {
                         var inBuf = parentBuffers[i];
                         var inDf = PolarisBridge.PartitionBufferToDataFrame(inBuf, zeroCopy: false);
-                        var filteredDf = inDf.Filter(expr);
-                        if (filteredDf.Columns.Count == 0 && inDf.Columns.Count > 0)
-                        {
-                            filteredDf = new DataFrame(inDf.Columns.Select(c => c.CloneEmpty(0)).ToList());
-                        }
+                        var filteredDf = Glacier.Cluster.Worker.TaskExecutor.ApplyFusedOperators(inDf, ops);
                         outBuffers.Add(PolarisBridge.DataFrameToPartitionBuffer(filteredDf));
                     }
                     stageOutputs[stage.StageId] = outBuffers;

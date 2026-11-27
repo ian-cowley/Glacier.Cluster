@@ -104,17 +104,7 @@ public sealed class TaskExecutor : IDisposable
                             try
                             {
                                 var inDf = PolarisBridge.PartitionBufferToDataFrame(regBuffer, zeroCopy: false);
-                                var originalCols = inDf.Columns;
-                                foreach (var filterPredicate in filterPredicates)
-                                {
-                                    var expr = PredicateCompiler.Compile(filterPredicate);
-                                    var filteredDf = inDf.Filter(expr);
-                                    if (filteredDf.Columns.Count == 0 && originalCols.Count > 0)
-                                    {
-                                        filteredDf = new DataFrame(originalCols.Select(c => c.CloneEmpty(0)).ToList());
-                                    }
-                                    inDf = filteredDf;
-                                }
+                                inDf = ApplyFusedOperators(inDf, filterPredicates);
                                 var filteredBuf = PolarisBridge.DataFrameToPartitionBuffer(inDf);
                                 regBuffer.Release();
                                 regBuffer = filteredBuf;
@@ -445,33 +435,43 @@ public sealed class TaskExecutor : IDisposable
             scannedDf = new DataFrame(scannedDf.Columns.Select(c => c.CloneEmpty(0)).ToList());
         }
 
-        var originalCols = scannedDf.Columns;
-        foreach (var filterPredicate in filterPredicates)
-        {
-            var expr = PredicateCompiler.Compile(filterPredicate);
-            var filteredDf = scannedDf.Filter(expr);
-            if (filteredDf.Columns.Count == 0 && originalCols.Count > 0)
-            {
-                filteredDf = new DataFrame(originalCols.Select(c => c.CloneEmpty(0)).ToList());
-            }
-            scannedDf = filteredDf;
-        }
+        scannedDf = ApplyFusedOperators(scannedDf, filterPredicates);
 
         var outBuffer = PolarisBridge.DataFrameToPartitionBuffer(scannedDf);
         return (outBuffer, (ulong)scannedDf.RowCount);
+    }
+
+    internal static DataFrame ApplyFusedOperators(DataFrame df, IEnumerable<string> operations)
+    {
+        foreach (var op in operations)
+        {
+            if (string.IsNullOrWhiteSpace(op)) continue;
+
+            if (op.StartsWith("PROJECT:", StringComparison.Ordinal))
+            {
+                string[] cols = op["PROJECT:".Length..].Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+                df = df.Select(cols);
+            }
+            else
+            {
+                var preCols = df.Columns;
+                var expr = PredicateCompiler.Compile(op);
+                var filtered = df.Filter(expr);
+                if (filtered.Columns.Count == 0 && preCols.Count > 0)
+                {
+                    filtered = new DataFrame(preCols.Select(c => c.CloneEmpty(0)).ToList());
+                }
+                df = filtered;
+            }
+        }
+        return df;
     }
 
     private static DataFrame ExecuteFilter(DataFrame df, ReadOnlyMemory<byte> payload)
     {
         if (payload.IsEmpty) return df;
         string exprStr = Encoding.UTF8.GetString(payload.Span);
-        var expr = PredicateCompiler.Compile(exprStr);
-        var filteredDf = df.Filter(expr);
-        if (filteredDf.Columns.Count == 0 && df.Columns.Count > 0)
-        {
-            filteredDf = new DataFrame(df.Columns.Select(c => c.CloneEmpty(0)).ToList());
-        }
-        return filteredDf;
+        return ApplyFusedOperators(df, exprStr.Split('|', StringSplitOptions.RemoveEmptyEntries));
     }
 
     private static DataFrame ExecuteProject(DataFrame df, ReadOnlyMemory<byte> payload)

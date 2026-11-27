@@ -182,6 +182,7 @@ public static class FusedSocketTransport
         {
             if (targetBuffer.Length < CombinedHeaderSize + activationPayloadLen)
             {
+                DrainPayload(socket, targetBuffer, activationPayloadLen);
                 payloadSpan = ReadOnlySpan<byte>.Empty;
                 return false;
             }
@@ -238,6 +239,7 @@ public static class FusedSocketTransport
         {
             if (targetBuffer.Length < CombinedHeaderSize + activationPayloadLen)
             {
+                await DrainPayloadAsync(socket, targetBuffer, activationPayloadLen, cancellationToken).ConfigureAwait(false);
                 return (default, default, 0);
             }
 
@@ -480,6 +482,7 @@ public static class FusedSocketTransport
 
         if (targetBuffer.Length < CombinedHeaderSize)
         {
+            await DrainPayloadAsync(socket, targetBuffer, (int)clusterHeader.PayloadLength, cancellationToken).ConfigureAwait(false);
             return (default, default, 0);
         }
 
@@ -496,6 +499,7 @@ public static class FusedSocketTransport
         {
             if (targetBuffer.Length < CombinedHeaderSize + payloadLen)
             {
+                await DrainPayloadAsync(socket, targetBuffer, payloadLen, cancellationToken).ConfigureAwait(false);
                 return (default, default, 0);
             }
 

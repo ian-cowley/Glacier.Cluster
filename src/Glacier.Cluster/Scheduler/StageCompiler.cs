@@ -97,7 +97,25 @@ public sealed class StageCompiler
 
                 if (!sourceStage.IsShuffleBoundary)
                 {
-                    // Greedy 1:1 operator fusion: fuse projection into current narrow pipeline
+                    // Fuse projection into current narrow pipeline without dropping projection columns
+                    stages.Remove(sourceStage);
+                    string existingPayload = Encoding.UTF8.GetString(sourceStage.OperatorPayload.Span);
+                    string projCols = string.Join(",", project.Columns);
+                    string combined = string.IsNullOrEmpty(existingPayload)
+                        ? $"PROJECT:{projCols}"
+                        : $"{existingPayload}|PROJECT:{projCols}";
+                    byte[] fusedPayload = Encoding.UTF8.GetBytes(combined);
+
+                    var fusedStage = new ExecutionStage(
+                        sourceStage.StageId,
+                        jobId,
+                        $"{sourceStage.StageName}_Project",
+                        isShuffleBoundary: false,
+                        partitionsCount: sourceStage.PartitionsCount,
+                        primaryOperator: sourceStage.PrimaryOperator,
+                        operatorPayload: fusedPayload,
+                        parentStageIds: sourceStage.ParentStageIds);
+                    stages.Add(fusedStage);
                     return sourceStageId;
                 }
 
