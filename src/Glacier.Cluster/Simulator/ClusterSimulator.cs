@@ -2,6 +2,7 @@ namespace Glacier.Cluster.Simulator;
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO.Pipelines;
 using System.Linq;
 using System.Threading;
@@ -27,6 +28,7 @@ public sealed class ClusterSimulator : IAsyncDisposable, IDisposable
     private readonly List<SimulatedWorkerNode> _workers = new();
     private readonly List<IDuplexPipe> _workerPipes = new();
     private readonly List<IDuplexPipe> _coordPipes = new();
+    private readonly List<string> _registeredDatasetUris = new();
 
     private ClusterCoordinator? _coordinator;
     private bool _isRunning;
@@ -116,7 +118,19 @@ public sealed class ClusterSimulator : IAsyncDisposable, IDisposable
             {
                 await worker.StopAsync(cancellationToken).ConfigureAwait(false);
             }
-            catch { /* Ignore disconnect errors during teardown */ }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Trace.TraceWarning($"[ClusterSimulator] Worker teardown warning for '{worker.NodeId}': {ex.Message}");
+            }
+        }
+
+        lock (_registeredDatasetUris)
+        {
+            foreach (var uri in _registeredDatasetUris)
+            {
+                InMemoryDistributedExecutionContext.UnregisterDataSource(uri);
+            }
+            _registeredDatasetUris.Clear();
         }
 
         if (_coordinator != null)
@@ -203,9 +217,9 @@ public sealed class ClusterSimulator : IAsyncDisposable, IDisposable
         }
 
         InMemoryDistributedExecutionContext.RegisterDataSource(uri, buffers);
-        foreach (var col in partitions[0].Columns)
+        lock (_registeredDatasetUris)
         {
-            InMemoryDistributedExecutionContext.RegisterDataSource(col.Name, buffers);
+            _registeredDatasetUris.Add(uri);
         }
 
         var execContext = new ClusterSimulatorExecutionContext(this, datasetName);
@@ -297,6 +311,7 @@ public sealed class ClusterSimulator : IAsyncDisposable, IDisposable
                 Array.Copy(nodeFeatures[0], srcIdx, initialCentroids, c * dimensions, dimensions);
             }
 
+            Guid kmeansSessionId = Guid.NewGuid();
             var tasks = new Task[worldSize];
             for (int i = 0; i < worldSize; i++)
             {
@@ -309,7 +324,8 @@ public sealed class ClusterSimulator : IAsyncDisposable, IDisposable
                         dimensions,
                         ringWorkers[rank],
                         initialCentroids,
-                        cancellationToken).ConfigureAwait(false);
+                        cancellationToken,
+                        kmeansSessionId).ConfigureAwait(false);
                 }, cancellationToken);
             }
 

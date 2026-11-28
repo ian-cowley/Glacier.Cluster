@@ -19,6 +19,7 @@ public sealed class ClusterWorker : IAsyncDisposable, IDisposable
 {
     private readonly ClusterWorkerOptions _options;
     private readonly LocalPartitionStore _partitionStore;
+    private readonly IDiskSpillManager? _ownedSpillManager;
     private readonly ArrowShuffleServer _shuffleServer;
     private readonly IArrowShuffleClient _shuffleClient;
     private readonly TaskExecutor _taskExecutor;
@@ -50,14 +51,22 @@ public sealed class ClusterWorker : IAsyncDisposable, IDisposable
         _options = options ?? new ClusterWorkerOptions();
         _profile = _options.HardwareProfile ?? NodeHardwareProfile.ProbeLocal(nodeId: _options.NodeId);
 
+        if (spillManager == null)
+        {
+            string? explicitDir = string.IsNullOrWhiteSpace(_options.SpillDirectory) ? null : _options.SpillDirectory;
+            _ownedSpillManager = new DiskSpillManager(scratchDirectory: explicitDir, nodeId: _profile.NodeId);
+            spillManager = _ownedSpillManager;
+        }
+
         _partitionStore = partitionStore ?? new LocalPartitionStore(_profile.NodeId);
         _shuffleServer = new ArrowShuffleServer(
             null,
             _partitionStore,
             spillManager,
-            port: _options.ShufflePort);
+            port: _options.ShufflePort,
+            clusterSecret: _options.ClusterSecret);
 
-        _shuffleClient = _options.ShuffleClient ?? new ArrowShuffleClient();
+        _shuffleClient = _options.ShuffleClient ?? new ArrowShuffleClient(clusterSecret: _options.ClusterSecret);
         _taskExecutor = new TaskExecutor(
             _profile.NodeId,
             _partitionStore,
@@ -102,10 +111,7 @@ public sealed class ClusterWorker : IAsyncDisposable, IDisposable
         var joinRequest = new NodeJoinRequestMessage(_profile, _options.Hostname, _options.ClusterSecret, ShufflePort);
         ulong correlationId = Interlocked.Increment(ref _correlationIdCounter);
 
-        byte[] reqBuf = new byte[joinRequest.GetByteCount() + ClusterFrameHeader.HeaderSize];
-        ClusterMessageSerializer.PackFrame(joinRequest, correlationId, ClusterFrameFlags.None, reqBuf);
-
-        var responseFrame = await _coordinatorConnection.SendRequestAsync(joinRequest, correlationId, TimeSpan.FromSeconds(10), cancellationToken).ConfigureAwait(false);
+        using var responseFrame = await _coordinatorConnection.SendRequestAsync(joinRequest, correlationId, TimeSpan.FromSeconds(10), cancellationToken).ConfigureAwait(false);
         var joinResponse = (NodeJoinResponseMessage)ClusterMessageSerializer.Deserialize(
             ClusterMessageType.NodeJoinResponse,
             responseFrame.Payload.Span);
@@ -131,14 +137,15 @@ public sealed class ClusterWorker : IAsyncDisposable, IDisposable
         {
             var leaveMsg = new NodeLeaveMessage(NodeId, 0, 5000, "GracefulShutdown");
             ulong correlationId = Interlocked.Increment(ref _correlationIdCounter);
-            byte[] buf = new byte[leaveMsg.GetByteCount() + ClusterFrameHeader.HeaderSize];
-            ClusterMessageSerializer.PackFrame(leaveMsg, correlationId, ClusterFrameFlags.None, buf);
 
             try
             {
-                await _coordinatorConnection.SendRawFrameAsync(buf, cancellationToken).ConfigureAwait(false);
+                await _coordinatorConnection.SendFrameAsync(leaveMsg, correlationId, flags: 0, cancellationToken).ConfigureAwait(false);
             }
-            catch { /* Ignore disconnect errors during leave */ }
+            catch (Exception ex)
+            {
+                Trace.TraceWarning($"[ClusterWorker] Graceful leave send warning: {ex.Message}");
+            }
         }
 
         await DisposeAsync().ConfigureAwait(false);
@@ -159,10 +166,8 @@ public sealed class ClusterWorker : IAsyncDisposable, IDisposable
                     availablePhysicalMemoryBytes: (ulong)GC.GetGCMemoryInfo().TotalAvailableMemoryBytes);
 
                 ulong correlationId = Interlocked.Increment(ref _correlationIdCounter);
-                byte[] pingBuf = new byte[HeartbeatPingMessage.PayloadSize + ClusterFrameHeader.HeaderSize];
-                ClusterMessageSerializer.PackFrame(ping, correlationId, ClusterFrameFlags.None, pingBuf);
 
-                var pongFrame = await _coordinatorConnection!.SendRequestAsync(ping, correlationId, TimeSpan.FromSeconds(5), ct).ConfigureAwait(false);
+                using var pongFrame = await _coordinatorConnection!.SendRequestAsync(ping, correlationId, TimeSpan.FromSeconds(5), ct).ConfigureAwait(false);
                 var pong = (HeartbeatPongMessage)ClusterMessageSerializer.Deserialize(
                     ClusterMessageType.HeartbeatPong,
                     pongFrame.Payload.Span);
@@ -170,7 +175,10 @@ public sealed class ClusterWorker : IAsyncDisposable, IDisposable
                 _clusterEpoch = pong.ClusterEpoch;
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
-            catch { /* Heartbeat will be retried on next tick */ }
+            catch (Exception ex)
+            {
+                Trace.TraceWarning($"[ClusterWorker] Heartbeat tick warning: {ex.Message}");
+            }
         }
     }
 
@@ -187,15 +195,13 @@ public sealed class ClusterWorker : IAsyncDisposable, IDisposable
                 TaskStatusUpdateMessage status = await _taskExecutor.ExecuteTaskAsync(dispatch, _cts.Token).ConfigureAwait(false);
 
                 ulong correlationId = Interlocked.Increment(ref _correlationIdCounter);
-                byte[] statusBuf = new byte[status.GetByteCount() + ClusterFrameHeader.HeaderSize];
-                ClusterMessageSerializer.PackFrame(status, correlationId, ClusterFrameFlags.None, statusBuf);
-
                 if (_coordinatorConnection != null && _coordinatorConnection.IsConnected)
                 {
-                    await _coordinatorConnection.SendRawFrameAsync(statusBuf, _cts.Token).ConfigureAwait(false);
+                    await _coordinatorConnection.SendFrameAsync(status, correlationId, flags: 0, _cts.Token).ConfigureAwait(false);
                 }
             }, _cts.Token);
         }
+        await ValueTask.CompletedTask;
     }
 
     public async ValueTask DisposeAsync()
@@ -212,8 +218,24 @@ public sealed class ClusterWorker : IAsyncDisposable, IDisposable
         await _shuffleClient.DisposeAsync().ConfigureAwait(false);
         _taskExecutor.Dispose();
         _partitionStore.Dispose();
+        if (_ownedSpillManager != null)
+        {
+            await _ownedSpillManager.DisposeAsync().ConfigureAwait(false);
+        }
         _cts.Dispose();
     }
 
-    public void Dispose() => DisposeAsync().AsTask().GetAwaiter().GetResult();
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _isDisposed, 1) != 0) return;
+        _cts.Cancel();
+
+        _coordinatorConnection?.Dispose();
+        _shuffleServer.Dispose();
+        _shuffleClient.Dispose();
+        _taskExecutor.Dispose();
+        _partitionStore.Dispose();
+        _ownedSpillManager?.Dispose();
+        _cts.Dispose();
+    }
 }

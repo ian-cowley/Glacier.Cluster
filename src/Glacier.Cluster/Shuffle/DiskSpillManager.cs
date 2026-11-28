@@ -2,6 +2,7 @@ namespace Glacier.Cluster.Shuffle;
 
 using System;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Pipelines;
 using System.Threading;
@@ -49,6 +50,7 @@ public interface IDiskSpillManager : IAsyncDisposable, IDisposable
 public sealed class DiskSpillManager : IDiskSpillManager
 {
     private readonly string _scratchDirectory;
+    private readonly bool _ownsScratchDirectory;
     private readonly ulong _maxMemoryBytes;
     private readonly double _highWatermark;
     private readonly double _lowWatermark;
@@ -69,15 +71,32 @@ public sealed class DiskSpillManager : IDiskSpillManager
         ulong maxMemoryBytes = 0,
         double highWatermark = 0.80,
         double lowWatermark = 0.60,
-        LocalPartitionStore? partitionStore = null)
+        LocalPartitionStore? partitionStore = null,
+        Guid? nodeId = null)
     {
-        _scratchDirectory = scratchDirectory ?? Path.Combine(Path.GetTempPath(), ".glacier_shuffle");
+        if (string.IsNullOrWhiteSpace(scratchDirectory))
+        {
+            Guid scopeId = nodeId ?? Guid.NewGuid();
+            _scratchDirectory = Path.Combine(Path.GetTempPath(), ".glacier_shuffle", scopeId.ToString("N"));
+            _ownsScratchDirectory = true;
+        }
+        else if (nodeId.HasValue)
+        {
+            _scratchDirectory = Path.Combine(scratchDirectory, nodeId.Value.ToString("N"));
+            _ownsScratchDirectory = true;
+        }
+        else
+        {
+            _scratchDirectory = scratchDirectory;
+            _ownsScratchDirectory = false;
+        }
+
         _maxMemoryBytes = maxMemoryBytes > 0 ? maxMemoryBytes : GetDefaultMaxMemory();
         _highWatermark = highWatermark;
         _lowWatermark = lowWatermark;
         _partitionStore = partitionStore;
 
-        // Ensure root scratch directory exists and purge stale remnants from prior crashed runs
+        // Ensure this node-scoped scratch directory exists; never wipe sibling node directories.
         Directory.CreateDirectory(_scratchDirectory);
         PurgeStaleScratchFiles();
     }
@@ -167,7 +186,7 @@ public sealed class DiskSpillManager : IDiskSpillManager
             _partitionStates[key] = PartitionStorageState.InMemory;
             if (File.Exists(tmpPath))
             {
-                try { File.Delete(tmpPath); } catch { }
+                try { File.Delete(tmpPath); } catch (IOException ex) { Trace.TraceWarning($"[DiskSpillManager] Temp cleanup warning: {ex.Message}"); }
             }
             throw;
         }
@@ -259,7 +278,8 @@ public sealed class DiskSpillManager : IDiskSpillManager
                 if (_spillIndex.TryRemove(kvp.Key, out var meta))
                 {
                     _partitionStates.TryRemove(kvp.Key, out _);
-                    try { if (File.Exists(meta.FilePath)) File.Delete(meta.FilePath); } catch { }
+                    try { if (File.Exists(meta.FilePath)) File.Delete(meta.FilePath); }
+                    catch (IOException ex) { Trace.TraceWarning($"[DiskSpillManager] Stage file delete warning: {ex.Message}"); }
                 }
             }
         }
@@ -287,22 +307,31 @@ public sealed class DiskSpillManager : IDiskSpillManager
                 Directory.Delete(jobDir, recursive: true);
             }
         }
-        catch { }
+        catch (IOException ex)
+        {
+            Trace.TraceWarning($"[DiskSpillManager] Job directory delete warning: {ex.Message}");
+        }
     }
 
     private void PurgeStaleScratchFiles()
     {
+        if (!_ownsScratchDirectory) return;
+
         try
         {
             if (Directory.Exists(_scratchDirectory))
             {
                 foreach (string dir in Directory.GetDirectories(_scratchDirectory))
                 {
-                    try { Directory.Delete(dir, recursive: true); } catch { }
+                    try { Directory.Delete(dir, recursive: true); }
+                    catch (IOException ex) { Trace.TraceWarning($"[DiskSpillManager] Scratch dir purge warning: {ex.Message}"); }
                 }
             }
         }
-        catch { }
+        catch (IOException ex)
+        {
+            Trace.TraceWarning($"[DiskSpillManager] Scratch purge warning: {ex.Message}");
+        }
     }
 
     private static ulong GetDefaultMaxMemory()
@@ -313,19 +342,32 @@ public sealed class DiskSpillManager : IDiskSpillManager
             : 4UL * 1024 * 1024 * 1024; // 4 GB fallback
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _isDisposed, 1) != 0)
-            return;
-
-        _spillLock.Dispose();
-        _spillIndex.Clear();
-        _partitionStates.Clear();
-        await Task.CompletedTask;
+        Dispose();
+        return ValueTask.CompletedTask;
     }
 
     public void Dispose()
     {
-        DisposeAsync().AsTask().GetAwaiter().GetResult();
+        if (Interlocked.Exchange(ref _isDisposed, 1) != 0)
+            return;
+
+        foreach (var meta in _spillIndex.Values)
+        {
+            try { if (File.Exists(meta.FilePath)) File.Delete(meta.FilePath); }
+            catch (IOException ex) { Trace.TraceWarning($"[DiskSpillManager] Dispose file delete warning: {ex.Message}"); }
+        }
+
+        _spillIndex.Clear();
+        _partitionStates.Clear();
+
+        if (_ownsScratchDirectory && Directory.Exists(_scratchDirectory))
+        {
+            try { Directory.Delete(_scratchDirectory, recursive: true); }
+            catch (IOException ex) { Trace.TraceWarning($"[DiskSpillManager] Dispose dir delete warning: {ex.Message}"); }
+        }
+
+        _spillLock.Dispose();
     }
 }

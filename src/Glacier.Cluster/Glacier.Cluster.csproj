@@ -35,19 +35,19 @@
     <InternalsVisibleTo Include="Glacier.Cluster.Tests" />
   </ItemGroup>
 
-  <ItemGroup Condition="Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') and '$(UseLocalProjectReferences)' != 'false'">
-    <ProjectReference Include="../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj" />
-    <ProjectReference Include="../../../Glacier.Polaris/src/Glacier.Polaris/Glacier.Polaris.csproj" />
-    <ProjectReference Include="../../../Glacier.Inference/src/Glacier.Inference/Glacier.Inference.csproj" />
-  </ItemGroup>
-  <ItemGroup Condition="!Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') or '$(UseLocalProjectReferences)' == 'false'">
-    <PackageReference Include="Glacier.Formats" Version="1.0.1" />
-    <PackageReference Include="Glacier.Polaris" Version="1.2.6" />
-    <PackageReference Include="Glacier.Inference" Version="1.10.1" />
+  <ItemGroup>
+    <ProjectReference Include="../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj" Condition="Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') and '$(UseLocalProjectReferences)' != 'false'" />
+    <PackageReference Include="Glacier.Formats" Condition="!Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') or '$(UseLocalProjectReferences)' == 'false'" />
+
+    <ProjectReference Include="../../../Glacier.Polaris/src/Glacier.Polaris/Glacier.Polaris.csproj" Condition="Exists('../../../Glacier.Polaris/src/Glacier.Polaris/Glacier.Polaris.csproj') and '$(UseLocalProjectReferences)' != 'false'" />
+    <PackageReference Include="Glacier.Polaris" Condition="!Exists('../../../Glacier.Polaris/src/Glacier.Polaris/Glacier.Polaris.csproj') or '$(UseLocalProjectReferences)' == 'false'" />
+
+    <ProjectReference Include="../../../Glacier.Inference/src/Glacier.Inference/Glacier.Inference.csproj" Condition="Exists('../../../Glacier.Inference/src/Glacier.Inference/Glacier.Inference.csproj') and '$(UseLocalProjectReferences)' != 'false'" />
+    <PackageReference Include="Glacier.Inference" Condition="!Exists('../../../Glacier.Inference/src/Glacier.Inference/Glacier.Inference.csproj') or '$(UseLocalProjectReferences)' == 'false'" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="System.IO.Hashing" Version="10.0.12" />
-    <PackageReference Include="System.Numerics.Tensors" Version="10.0.12" />
-    <PackageReference Include="System.Security.Cryptography.Pkcs" Version="10.0.14" />
+    <PackageReference Include="System.IO.Hashing" />
+    <PackageReference Include="System.Numerics.Tensors" />
+    <PackageReference Include="System.Security.Cryptography.Pkcs" />
   </ItemGroup>
 </Project>

@@ -45,7 +45,8 @@ public enum PartitionFetchStatus : byte
     NotFound = 1,
     SpilledToDisk = 2,
     NotReadyYet = 3,
-    Error = 4
+    Error = 4,
+    Unauthorized = 5
 }
 
 /// <summary>Flags decorating partition data in PartitionFetchResponseMessage.</summary>

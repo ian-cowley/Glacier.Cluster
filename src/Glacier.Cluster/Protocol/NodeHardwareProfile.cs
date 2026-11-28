@@ -4,6 +4,7 @@ using System;
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Text.Json.Serialization;
 
 /// <summary>
 /// 64-byte sequentially packed hardware telemetry and capability descriptor.
@@ -47,21 +48,31 @@ public partial struct NodeHardwareProfile : IEquatable<NodeHardwareProfile>
     // Convenience Properties
     // =========================================================================
 
+    [JsonIgnore]
     public readonly bool HasAvx512 => (SimdFlags & SimdArchitectureFlags.Avx512) != 0;
+    [JsonIgnore]
     public readonly bool HasAvx2 => (SimdFlags & SimdArchitectureFlags.Avx2) != 0;
+    [JsonIgnore]
     public readonly bool HasCuda => (GpuFlags & GpuBackendFlags.Cuda) != 0;
+    [JsonIgnore]
     public readonly bool HasRocm => (GpuFlags & GpuBackendFlags.Rocm) != 0;
+    [JsonIgnore]
     public readonly bool HasDirect3D12 => (GpuFlags & GpuBackendFlags.Direct3D12) != 0;
+    [JsonIgnore]
     public readonly bool HasVulkan => (GpuFlags & GpuBackendFlags.Vulkan) != 0;
+    [JsonIgnore]
     public readonly bool HasMetal => (GpuFlags & GpuBackendFlags.Metal) != 0;
+    [JsonIgnore]
     public readonly bool HasGpu => GpuFlags != GpuBackendFlags.None;
 
+    [JsonIgnore]
     public uint HostIpv4Address
     {
         readonly get => Reserved1;
         set => Reserved1 = value;
     }
 
+    [JsonIgnore]
     public readonly string HostIpAddressString
     {
         get

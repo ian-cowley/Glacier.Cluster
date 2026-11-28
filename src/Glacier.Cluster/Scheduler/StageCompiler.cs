@@ -13,14 +13,27 @@ using Glacier.Cluster.Scheduler.LogicalPlan;
 /// </summary>
 public sealed class StageCompiler
 {
+    private readonly bool _defaultAutoRepartitionJoins;
     private int _stageIdCounter;
 
-    public ExecutionDag Compile(Guid jobId, string jobName, LogicalPlanNode rootNode, int defaultPartitions = 8)
+    public StageCompiler(bool autoRepartitionJoins = false)
+    {
+        _defaultAutoRepartitionJoins = autoRepartitionJoins;
+    }
+
+    public ExecutionDag Compile(
+        Guid jobId,
+        string jobName,
+        LogicalPlanNode rootNode,
+        int defaultPartitions = 8,
+        bool? autoRepartitionJoins = null)
     {
         _stageIdCounter = 0;
         var stages = new List<ExecutionStage>();
+        var stagePartitionKeys = new Dictionary<int, string>();
+        bool repartitionJoins = autoRepartitionJoins ?? _defaultAutoRepartitionJoins;
 
-        int _ = CompileNode(jobId, rootNode, stages, defaultPartitions);
+        int _ = CompileNode(jobId, rootNode, stages, defaultPartitions, repartitionJoins, stagePartitionKeys);
 
         return new ExecutionDag(jobId, jobName, stages);
     }
@@ -29,7 +42,9 @@ public sealed class StageCompiler
         Guid jobId,
         LogicalPlanNode node,
         List<ExecutionStage> stages,
-        int defaultPartitions)
+        int defaultPartitions,
+        bool autoRepartitionJoins,
+        Dictionary<int, string> stagePartitionKeys)
     {
         switch (node)
         {
@@ -51,7 +66,7 @@ public sealed class StageCompiler
 
             case LogicalFilterNode filter:
             {
-                int sourceStageId = CompileNode(jobId, filter.Source, stages, defaultPartitions);
+                int sourceStageId = CompileNode(jobId, filter.Source, stages, defaultPartitions, autoRepartitionJoins, stagePartitionKeys);
                 var sourceStage = stages.First(s => s.StageId == sourceStageId);
 
                 if (!sourceStage.IsShuffleBoundary && sourceStage.PrimaryOperator == StageOperatorType.Scan)
@@ -87,12 +102,16 @@ public sealed class StageCompiler
                     operatorPayload: payload,
                     parentStageIds: new[] { sourceStageId });
                 stages.Add(stage);
+                if (stagePartitionKeys.TryGetValue(sourceStageId, out string? srcKeys))
+                {
+                    stagePartitionKeys[stageId] = srcKeys;
+                }
                 return stageId;
             }
 
             case LogicalProjectNode project:
             {
-                int sourceStageId = CompileNode(jobId, project.Source, stages, defaultPartitions);
+                int sourceStageId = CompileNode(jobId, project.Source, stages, defaultPartitions, autoRepartitionJoins, stagePartitionKeys);
                 var sourceStage = stages.First(s => s.StageId == sourceStageId);
 
                 if (!sourceStage.IsShuffleBoundary)
@@ -131,21 +150,32 @@ public sealed class StageCompiler
                     operatorPayload: payload,
                     parentStageIds: new[] { sourceStageId });
                 stages.Add(stage);
+                if (stagePartitionKeys.TryGetValue(sourceStageId, out string? srcKeys))
+                {
+                    stagePartitionKeys[stageId] = srcKeys;
+                }
                 return stageId;
             }
 
             case LogicalGroupByNode groupBy:
             {
                 // 1. Compile upstream source stage
-                int sourceStageId = CompileNode(jobId, groupBy.Source, stages, defaultPartitions);
+                int sourceStageId = CompileNode(jobId, groupBy.Source, stages, defaultPartitions, autoRepartitionJoins, stagePartitionKeys);
                 var sourceStage = stages.First(s => s.StageId == sourceStageId);
 
                 int mapStageId;
-                byte[] mapPayload = Encoding.UTF8.GetBytes(string.Join(",", groupBy.GroupKeys));
+                string groupKeysStr = string.Join(",", groupBy.GroupKeys);
+                byte[] mapPayload = Encoding.UTF8.GetBytes(groupKeysStr);
 
                 if (!sourceStage.IsShuffleBoundary && sourceStage.PrimaryOperator == StageOperatorType.Scan)
                 {
-                    // Greedy 1:1 operator fusion: fuse GroupByMap into Scan stage
+                    // Greedy 1:1 operator fusion: fuse GroupByMap into Scan stage while preserving Scan/Filter/Project payload!
+                    string existingPayload = Encoding.UTF8.GetString(sourceStage.OperatorPayload.Span);
+                    string fusedStr = string.IsNullOrEmpty(existingPayload)
+                        ? groupKeysStr
+                        : $"{existingPayload}\u001fGROUPBY:{groupKeysStr}";
+                    byte[] fusedMapPayload = Encoding.UTF8.GetBytes(fusedStr);
+
                     mapStageId = sourceStageId;
                     var fusedMapStage = new ExecutionStage(
                         sourceStageId,
@@ -154,7 +184,7 @@ public sealed class StageCompiler
                         isShuffleBoundary: false,
                         partitionsCount: sourceStage.PartitionsCount,
                         primaryOperator: StageOperatorType.GroupByMap,
-                        operatorPayload: mapPayload,
+                        operatorPayload: fusedMapPayload,
                         parentStageIds: sourceStage.ParentStageIds);
 
                     int idx = stages.FindIndex(s => s.StageId == sourceStageId);
@@ -188,6 +218,7 @@ public sealed class StageCompiler
                     operatorPayload: reducePayload,
                     parentStageIds: new[] { mapStageId });
                 stages.Add(reduceStage);
+                stagePartitionKeys[reduceStageId] = groupKeysStr;
 
                 return reduceStageId;
             }
@@ -195,10 +226,51 @@ public sealed class StageCompiler
             case LogicalHashJoinNode join:
             {
                 // 1. Compile Left and Right upstream sources
-                int leftStageId = CompileNode(jobId, join.LeftSource, stages, defaultPartitions);
-                int rightStageId = CompileNode(jobId, join.RightSource, stages, defaultPartitions);
+                int leftStageId = CompileNode(jobId, join.LeftSource, stages, defaultPartitions, autoRepartitionJoins, stagePartitionKeys);
+                int rightStageId = CompileNode(jobId, join.RightSource, stages, defaultPartitions, autoRepartitionJoins, stagePartitionKeys);
 
-                // 2. Wide Stage: HashJoin (Consumes shuffled partitions from left & right)
+                if (autoRepartitionJoins)
+                {
+                    var leftStage = stages.First(s => s.StageId == leftStageId);
+                    if (leftStage.PartitionsCount != join.TargetPartitions ||
+                        !stagePartitionKeys.TryGetValue(leftStageId, out string? leftKeys) ||
+                        !string.Equals(leftKeys, join.JoinKey, StringComparison.Ordinal))
+                    {
+                        int repLeftId = _stageIdCounter++;
+                        stages.Add(new ExecutionStage(
+                            repLeftId,
+                            jobId,
+                            $"Repartition_{repLeftId}",
+                            isShuffleBoundary: true,
+                            partitionsCount: join.TargetPartitions,
+                            primaryOperator: StageOperatorType.Custom,
+                            operatorPayload: Encoding.UTF8.GetBytes($"REPARTITION:{join.TargetPartitions}:{join.JoinKey}"),
+                            parentStageIds: new[] { leftStageId }));
+                        stagePartitionKeys[repLeftId] = join.JoinKey;
+                        leftStageId = repLeftId;
+                    }
+
+                    var rightStage = stages.First(s => s.StageId == rightStageId);
+                    if (rightStage.PartitionsCount != join.TargetPartitions ||
+                        !stagePartitionKeys.TryGetValue(rightStageId, out string? rightKeys) ||
+                        !string.Equals(rightKeys, join.JoinKey, StringComparison.Ordinal))
+                    {
+                        int repRightId = _stageIdCounter++;
+                        stages.Add(new ExecutionStage(
+                            repRightId,
+                            jobId,
+                            $"Repartition_{repRightId}",
+                            isShuffleBoundary: true,
+                            partitionsCount: join.TargetPartitions,
+                            primaryOperator: StageOperatorType.Custom,
+                            operatorPayload: Encoding.UTF8.GetBytes($"REPARTITION:{join.TargetPartitions}:{join.JoinKey}"),
+                            parentStageIds: new[] { rightStageId }));
+                        stagePartitionKeys[repRightId] = join.JoinKey;
+                        rightStageId = repRightId;
+                    }
+                }
+
+                // 2. Wide Stage: HashJoin (Consumes co-partitioned or hash-filtered partitions from left & right)
                 int joinStageId = _stageIdCounter++;
                 byte[] joinPayload = Encoding.UTF8.GetBytes(join.JoinKey);
                 var joinStage = new ExecutionStage(
@@ -211,13 +283,14 @@ public sealed class StageCompiler
                     operatorPayload: joinPayload,
                     parentStageIds: new[] { leftStageId, rightStageId });
                 stages.Add(joinStage);
+                stagePartitionKeys[joinStageId] = join.JoinKey;
 
                 return joinStageId;
             }
 
             case LogicalRepartitionNode repartition:
             {
-                int sourceStageId = CompileNode(jobId, repartition.Source, stages, defaultPartitions);
+                int sourceStageId = CompileNode(jobId, repartition.Source, stages, defaultPartitions, autoRepartitionJoins, stagePartitionKeys);
                 int repartitionStageId = _stageIdCounter++;
                 string keysStr = string.Join(",", repartition.PartitionKeys);
                 byte[] payload = Encoding.UTF8.GetBytes($"REPARTITION:{repartition.TargetPartitions}:{keysStr}");
@@ -231,6 +304,10 @@ public sealed class StageCompiler
                     operatorPayload: payload,
                     parentStageIds: new[] { sourceStageId });
                 stages.Add(repartitionStage);
+                if (!string.IsNullOrEmpty(keysStr))
+                {
+                    stagePartitionKeys[repartitionStageId] = keysStr;
+                }
                 return repartitionStageId;
             }
 

@@ -2,11 +2,13 @@ namespace Glacier.Cluster.Worker;
 
 using System;
 using System.Net;
+using System.Text.Json.Serialization;
 using Glacier.Cluster.Protocol;
 using Glacier.Cluster.Shuffle;
 
 public sealed class ClusterWorkerOptions
 {
+    [JsonIgnore]
     public EndPoint CoordinatorEndPoint { get; init; } = new IPEndPoint(IPAddress.Loopback, 9000);
     public Guid? NodeId { get; init; }
     public ushort ShufflePort { get; init; } = 0; // 0 = dynamic ephemeral port
@@ -30,5 +32,6 @@ public sealed class ClusterWorkerOptions
     /// <summary>
     /// Optional custom shuffle client (e.g. backed by InMemoryShuffleBus or FaultInjectingShuffleClient).
     /// </summary>
+    [JsonIgnore]
     public IArrowShuffleClient? ShuffleClient { get; init; }
 }

@@ -367,79 +367,89 @@ public static partial class DynamicThroughputCalibrator
             client.NoDelay = true;
             FusedSocketTransport.ConfigureSocket(client.Client, 1024 * 1024);
 
-            await client.ConnectAsync(node.Host, node.Port, cts.Token);
-            using var stream = client.GetStream();
+            await client.ConnectAsync(node.Host, node.Port, cts.Token).ConfigureAwait(false);
+            await using var channel = new TcpControlChannel(client.Client, ownsSocket: false);
 
-            // 1. Serialize Probe Request Frame
-            int reqPayloadLen = 24;
-            byte[] reqPayload = new byte[reqPayloadLen];
-            BinaryPrimitives.WriteInt32LittleEndian(reqPayload.AsSpan(0, 4), options.HiddenDim);
-            BinaryPrimitives.WriteInt32LittleEndian(reqPayload.AsSpan(4, 4), options.IntermediateDim);
-            BinaryPrimitives.WriteInt32LittleEndian(reqPayload.AsSpan(8, 4), options.VocabSize);
-            BinaryPrimitives.WriteInt32LittleEndian(reqPayload.AsSpan(12, 4), options.WarmupIterations);
-            BinaryPrimitives.WriteInt32LittleEndian(reqPayload.AsSpan(16, 4), options.MeasureIterations);
-            int flags = 0x01 | (options.MeasureLmHead ? 0x04 : 0);
-            BinaryPrimitives.WriteInt32LittleEndian(reqPayload.AsSpan(20, 4), flags);
-
-            var reqHdr = new ClusterFrameHeader(MsgCalibrateProbeRequest, correlationId: 1001, (ulong)reqPayloadLen);
-            byte[] reqHdrBytes = new byte[ClusterFrameHeader.HeaderSize];
-            MemoryMarshal.Write(reqHdrBytes, in reqHdr);
-
-            long tStart = Stopwatch.GetTimestamp();
-            await stream.WriteAsync(reqHdrBytes, 0, ClusterFrameHeader.HeaderSize, cts.Token);
-            await stream.WriteAsync(reqPayload, 0, reqPayloadLen, cts.Token);
-            await stream.FlushAsync(cts.Token);
-
-            // 2. Read Response Frame
-            byte[] respHdrBytes = new byte[ClusterFrameHeader.HeaderSize];
-            await ReadExactAsync(stream, respHdrBytes, 0, ClusterFrameHeader.HeaderSize, cts.Token);
-            var respHdr = MemoryMarshal.Read<ClusterFrameHeader>(respHdrBytes);
-            if (respHdr.Magic != ClusterFrameHeader.MagicConstant ||
-                respHdr.MessageType != MsgCalibrateProbeResponse ||
-                respHdr.PayloadLength < 32 ||
-                respHdr.PayloadLength > 4096)
+            // 1. Serialize Probe Request Frame via TcpControlChannel (Pipelines + ClusterCrc32)
+            const int reqPayloadLen = 24;
+            byte[] reqPayload = ArrayPool<byte>.Shared.Rent(reqPayloadLen);
+            byte[] respPayload = ArrayPool<byte>.Shared.Rent(4096);
+            try
             {
-                throw new InvalidDataException($"Invalid calibration response header (type=0x{(byte)respHdr.MessageType:X2}, len={respHdr.PayloadLength}).");
-            }
+                BinaryPrimitives.WriteInt32LittleEndian(reqPayload.AsSpan(0, 4), options.HiddenDim);
+                BinaryPrimitives.WriteInt32LittleEndian(reqPayload.AsSpan(4, 4), options.IntermediateDim);
+                BinaryPrimitives.WriteInt32LittleEndian(reqPayload.AsSpan(8, 4), options.VocabSize);
+                BinaryPrimitives.WriteInt32LittleEndian(reqPayload.AsSpan(12, 4), options.WarmupIterations);
+                BinaryPrimitives.WriteInt32LittleEndian(reqPayload.AsSpan(16, 4), options.MeasureIterations);
+                int flags = 0x01 | (options.MeasureLmHead ? 0x04 : 0);
+                BinaryPrimitives.WriteInt32LittleEndian(reqPayload.AsSpan(20, 4), flags);
 
-            int respPayloadLen = (int)respHdr.PayloadLength;
-            byte[] respPayload = new byte[respPayloadLen];
-            await ReadExactAsync(stream, respPayload, 0, respPayloadLen, cts.Token);
-            long tEnd = Stopwatch.GetTimestamp();
+                long tStart = Stopwatch.GetTimestamp();
+                await channel.SendRawPayloadAsync(
+                    MsgCalibrateProbeRequest,
+                    reqPayload.AsMemory(0, reqPayloadLen),
+                    correlationId: 1001,
+                    ClusterFrameFlags.None,
+                    cts.Token).ConfigureAwait(false);
 
-            double rttMs = (tEnd - tStart) * 1000.0 / Stopwatch.Frequency;
+                // 2. Read Response Frame via TcpControlChannel (enforces ClusterFrameReader.DefaultMaxFrameBytes)
+                var (respHdr, respPayloadLen) = await channel.ReceiveExactFrameAsync(
+                    MsgCalibrateProbeResponse,
+                    respPayload.AsMemory(0, 4096),
+                    maxFrameBytes: 4096,
+                    verifyCrc32: false,
+                    cts.Token).ConfigureAwait(false);
+                long tEnd = Stopwatch.GetTimestamp();
 
-            // 3. Parse Probe Response Payload
-            double remoteTau = BitConverter.ToDouble(respPayload, 0);
-            double remoteLmHead = BitConverter.ToDouble(respPayload, 8);
-            ulong remoteRam = BinaryPrimitives.ReadUInt64LittleEndian(respPayload.AsSpan(16, 8));
-            ulong remoteVram = BinaryPrimitives.ReadUInt64LittleEndian(respPayload.AsSpan(24, 8));
-
-            string deviceName = node.DeviceName;
-            if (respPayloadLen >= 36)
-            {
-                int nameLen = BinaryPrimitives.ReadInt32LittleEndian(respPayload.AsSpan(32, 4));
-                if (nameLen > 0 && 36 + nameLen <= respPayloadLen)
+                if (respPayloadLen < 32)
                 {
-                    deviceName = Encoding.UTF8.GetString(respPayload, 36, nameLen);
+                    throw new InvalidDataException($"Invalid calibration response length ({respPayloadLen}).");
                 }
+                if (respHdr.PayloadCrc32 != 0 &&
+                    ClusterCrc32.Compute(respPayload.AsSpan(0, respPayloadLen)) != respHdr.PayloadCrc32)
+                {
+                    throw new InvalidDataException("Calibration response CRC32 mismatch.");
+                }
+
+                double rttMs = (tEnd - tStart) * 1000.0 / Stopwatch.Frequency;
+
+                // 3. Parse Probe Response Payload
+                double remoteTau = BitConverter.ToDouble(respPayload, 0);
+                double remoteLmHead = BitConverter.ToDouble(respPayload, 8);
+                ulong remoteRam = BinaryPrimitives.ReadUInt64LittleEndian(respPayload.AsSpan(16, 8));
+                ulong remoteVram = BinaryPrimitives.ReadUInt64LittleEndian(respPayload.AsSpan(24, 8));
+
+                string deviceName = node.DeviceName;
+                if (respPayloadLen >= 36)
+                {
+                    int nameLen = BinaryPrimitives.ReadInt32LittleEndian(respPayload.AsSpan(32, 4));
+                    if (nameLen > 0 && 36 + nameLen <= respPayloadLen)
+                    {
+                        deviceName = Encoding.UTF8.GetString(respPayload, 36, nameLen);
+                    }
+                }
+
+                // Isolate network transit latency (one-way hop)
+                double netHopMs = Math.Max(0.05, (rttMs - remoteTau) / 2.0);
+
+                return new NodeCalibrationResult(
+                    NodeName: node.Name,
+                    Host: node.Host,
+                    Port: node.Port,
+                    IsLocal: false,
+                    DeviceName: deviceName,
+                    IsGpu: node.IsGpu,
+                    TauMsPerLayer: Math.Max(0.1, remoteTau),
+                    DeltaStageOverheadMs: Math.Max(0.1, remoteLmHead),
+                    NetworkHopMs: netHopMs,
+                    UsableMemoryBytes: remoteVram > 0 ? remoteVram : (ulong)(remoteRam * 0.75),
+                    IsSuccess: true);
             }
-
-            // Isolate network transit latency (one-way hop)
-            double netHopMs = Math.Max(0.05, (rttMs - remoteTau) / 2.0);
-
-            return new NodeCalibrationResult(
-                NodeName: node.Name,
-                Host: node.Host,
-                Port: node.Port,
-                IsLocal: false,
-                DeviceName: deviceName,
-                IsGpu: node.IsGpu,
-                TauMsPerLayer: Math.Max(0.1, remoteTau),
-                DeltaStageOverheadMs: Math.Max(0.1, remoteLmHead),
-                NetworkHopMs: netHopMs,
-                UsableMemoryBytes: remoteVram > 0 ? remoteVram : (ulong)(remoteRam * 0.75),
-                IsSuccess: true);
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(reqPayload);
+                ArrayPool<byte>.Shared.Return(respPayload);
+            }
         }
         catch (Exception ex)
         {
@@ -489,6 +499,12 @@ public static partial class DynamicThroughputCalibrator
         {
             await ReadExactAsync(stream, reqPayload, 0, payloadLen, ct);
 
+            if (requestHeader.PayloadCrc32 != 0 &&
+                ClusterCrc32.Compute(reqPayload.AsSpan(0, payloadLen)) != requestHeader.PayloadCrc32)
+            {
+                throw new InvalidDataException("Calibration probe request CRC32 mismatch.");
+            }
+
             hiddenDim = BinaryPrimitives.ReadInt32LittleEndian(reqPayload.AsSpan(0, 4));
             intermediateDim = BinaryPrimitives.ReadInt32LittleEndian(reqPayload.AsSpan(4, 4));
             vocabSize = BinaryPrimitives.ReadInt32LittleEndian(reqPayload.AsSpan(8, 4));
@@ -535,7 +551,8 @@ public static partial class DynamicThroughputCalibrator
         BinaryPrimitives.WriteInt32LittleEndian(respPayload.AsSpan(32, 4), nameBytes.Length);
         nameBytes.CopyTo(respPayload.AsSpan(36));
 
-        var respHdr = new ClusterFrameHeader(MsgCalibrateProbeResponse, requestHeader.CorrelationId, (ulong)respLen);
+        uint respCrc = ClusterCrc32.Compute(respPayload);
+        var respHdr = new ClusterFrameHeader(MsgCalibrateProbeResponse, requestHeader.CorrelationId, (ulong)respLen, respCrc);
         byte[] respHdrBytes = new byte[ClusterFrameHeader.HeaderSize];
         MemoryMarshal.Write(respHdrBytes, in respHdr);
 

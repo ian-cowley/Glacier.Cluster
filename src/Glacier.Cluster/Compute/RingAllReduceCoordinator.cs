@@ -57,8 +57,12 @@ public sealed class RingAllReduceCoordinator
         if (nodes.Count <= 2)
             return nodes.ToList();
 
-        // Sort by NodeId for deterministic tie-breaking and ring stability
-        return nodes.OrderBy(n => n.NodeId).ToList();
+        // Group nodes by /24 IPv4 subnet so intra-subnet ring hops precede cross-subnet hops,
+        // breaking ties deterministically by NodeId.
+        return nodes
+            .OrderBy(n => n.HostIpv4Address & 0xFFFFFF00u)
+            .ThenBy(n => n.NodeId)
+            .ToList();
     }
 
     /// <summary>

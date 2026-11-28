@@ -86,7 +86,18 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
             copyList.Add(b);
         }
 
-        s_registeredSources[uri] = copyList;
+        s_registeredSources.AddOrUpdate(
+            uri,
+            _ => copyList,
+            (_, existing) =>
+            {
+                foreach (var oldBuf in existing)
+                {
+                    oldBuf.Release();
+                }
+                return copyList;
+            });
+
         lock (_ownedUris)
         {
             _ownedUris.Add(uri);
@@ -105,7 +116,39 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
             copyList.Add(b);
         }
 
-        s_registeredSources[uri] = copyList;
+        s_registeredSources.AddOrUpdate(
+            uri,
+            _ => copyList,
+            (_, existing) =>
+            {
+                foreach (var oldBuf in existing)
+                {
+                    oldBuf.Release();
+                }
+                return copyList;
+            });
+    }
+
+    /// <summary>
+    /// Removes a registered data source and releases its retained partition buffers.
+    /// </summary>
+    public static bool UnregisterDataSource(string uri)
+    {
+        if (string.IsNullOrWhiteSpace(uri))
+        {
+            return false;
+        }
+
+        if (s_registeredSources.TryRemove(uri, out var existing))
+        {
+            foreach (var oldBuf in existing)
+            {
+                oldBuf.Release();
+            }
+            return true;
+        }
+
+        return false;
     }
 
     public static bool TryGetSourcePartition(string uri, int partitionId, out RefCountedPartitionBuffer? buffer)
@@ -175,7 +218,7 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
                 {
                     foreach (var inBuf in sourceBuffers)
                     {
-                        var inDf = PolarisBridge.PartitionBufferToDataFrame(inBuf, zeroCopy: false);
+                        var inDf = PolarisBridge.PartitionBufferToDataFrame(inBuf, zeroCopy: true);
                         var filteredDf = inDf.Filter(expr);
                         if (filteredDf.Columns.Count == 0 && inDf.Columns.Count > 0)
                         {
@@ -203,7 +246,7 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
                 {
                     foreach (var inBuf in sourceBuffers)
                     {
-                        var inDf = PolarisBridge.PartitionBufferToDataFrame(inBuf, zeroCopy: false);
+                        var inDf = PolarisBridge.PartitionBufferToDataFrame(inBuf, zeroCopy: true);
                         var projDf = inDf.Select(project.Columns);
                         result.Add(PolarisBridge.DataFrameToPartitionBuffer(projDf));
                     }
@@ -221,14 +264,83 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
             case Glacier.Cluster.Scheduler.LogicalPlan.LogicalGroupByNode groupBy:
             {
                 var sourceBuffers = await ExecutePlanAsync(groupBy.Source, cancellationToken).ConfigureAwait(false);
-                var dfs = new List<DataFrame>(sourceBuffers.Count);
-
                 try
                 {
+                    var dfs = new List<DataFrame>(sourceBuffers.Count);
                     foreach (var b in sourceBuffers)
                     {
-                        dfs.Add(PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: false));
+                        dfs.Add(PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: true));
                     }
+
+                    var combinedDf = dfs.Count == 1 ? dfs[0] : (dfs.All(df => df.RowCount == 0) ? (dfs.FirstOrDefault(df => df.Columns.Count > 0) ?? new DataFrame()) : DataFrame.Concat(dfs));
+
+                    var parsedAggs = new List<(string col, string agg)>();
+                    var renameMap = new List<(string originalResultName, string targetAlias)>();
+
+                    foreach (var rawAgg in groupBy.Aggregations)
+                    {
+                        string trimmed = rawAgg.Trim();
+                        if (trimmed.StartsWith("SUM(", StringComparison.OrdinalIgnoreCase) && trimmed.EndsWith(')'))
+                        {
+                            string col = trimmed.Substring(4, trimmed.Length - 5).Trim();
+                            parsedAggs.Add((col, "sum"));
+                            renameMap.Add(($"{col}_sum", trimmed));
+                        }
+                        else if (trimmed.StartsWith("COUNT(", StringComparison.OrdinalIgnoreCase) && trimmed.EndsWith(')'))
+                        {
+                            string col = trimmed.Substring(6, trimmed.Length - 7).Trim();
+                            if (col == "*" || string.IsNullOrWhiteSpace(col))
+                            {
+                                col = groupBy.GroupKeys.Length > 0 ? groupBy.GroupKeys[0] : (combinedDf.Columns.Count > 0 ? combinedDf.Columns[0].Name : "count");
+                            }
+                            parsedAggs.Add((col, "count"));
+                            renameMap.Add(($"{col}_count", trimmed));
+                        }
+                        else if (trimmed.StartsWith("MEAN(", StringComparison.OrdinalIgnoreCase) && trimmed.EndsWith(')'))
+                        {
+                            string col = trimmed.Substring(5, trimmed.Length - 6).Trim();
+                            parsedAggs.Add((col, "mean"));
+                            renameMap.Add(($"{col}_mean", trimmed));
+                        }
+                        else if (trimmed.StartsWith("MIN(", StringComparison.OrdinalIgnoreCase) && trimmed.EndsWith(')'))
+                        {
+                            string col = trimmed.Substring(4, trimmed.Length - 5).Trim();
+                            parsedAggs.Add((col, "min"));
+                            renameMap.Add(($"{col}_min", trimmed));
+                        }
+                        else if (trimmed.StartsWith("MAX(", StringComparison.OrdinalIgnoreCase) && trimmed.EndsWith(')'))
+                        {
+                            string col = trimmed.Substring(4, trimmed.Length - 5).Trim();
+                            parsedAggs.Add((col, "max"));
+                            renameMap.Add(($"{col}_max", trimmed));
+                        }
+                        else
+                        {
+                            parsedAggs.Add((trimmed, "sum"));
+                            renameMap.Add(($"{trimmed}_sum", trimmed));
+                        }
+                    }
+
+                    DataFrame reducedDf;
+                    if (combinedDf.RowCount == 0 || dfs.All(df => df.RowCount == 0))
+                    {
+                        reducedDf = CreateEmptyGroupByDataFrame(dfs, groupBy.GroupKeys, parsedAggs, renameMap);
+                    }
+                    else
+                    {
+                        reducedDf = combinedDf.GroupBy(groupBy.GroupKeys).Agg(parsedAggs.ToArray());
+
+                        foreach (var (orig, target) in renameMap)
+                        {
+                            var col = reducedDf.Columns.FirstOrDefault(c => string.Equals(c.Name, orig, StringComparison.Ordinal));
+                            col?.Rename(target);
+                        }
+                    }
+
+                    return new List<RefCountedPartitionBuffer>(1)
+                    {
+                        PolarisBridge.DataFrameToPartitionBuffer(reducedDf)
+                    };
                 }
                 finally
                 {
@@ -237,82 +349,6 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
                         b.Release();
                     }
                 }
-
-                var combinedDf = dfs.Count == 1 ? dfs[0] : (dfs.All(df => df.RowCount == 0) ? (dfs.FirstOrDefault(df => df.Columns.Count > 0) ?? new DataFrame()) : DataFrame.Concat(dfs));
-
-                var parsedAggs = new List<(string col, string agg)>();
-                var renameMap = new List<(string originalResultName, string targetAlias)>();
-
-                foreach (var rawAgg in groupBy.Aggregations)
-                {
-                    string trimmed = rawAgg.Trim();
-                    if (trimmed.StartsWith("SUM(", StringComparison.OrdinalIgnoreCase) && trimmed.EndsWith(')'))
-                    {
-                        string col = trimmed.Substring(4, trimmed.Length - 5).Trim();
-                        parsedAggs.Add((col, "sum"));
-                        renameMap.Add(($"{col}_sum", trimmed));
-                    }
-                    else if (trimmed.StartsWith("COUNT(", StringComparison.OrdinalIgnoreCase) && trimmed.EndsWith(')'))
-                    {
-                        string col = trimmed.Substring(6, trimmed.Length - 7).Trim();
-                        if (col == "*" || string.IsNullOrWhiteSpace(col))
-                        {
-                            col = groupBy.GroupKeys.Length > 0 ? groupBy.GroupKeys[0] : (combinedDf.Columns.Count > 0 ? combinedDf.Columns[0].Name : "count");
-                        }
-                        parsedAggs.Add((col, "count"));
-                        renameMap.Add(($"{col}_count", trimmed));
-                    }
-                    else if (trimmed.StartsWith("MEAN(", StringComparison.OrdinalIgnoreCase) && trimmed.EndsWith(')'))
-                    {
-                        string col = trimmed.Substring(5, trimmed.Length - 6).Trim();
-                        parsedAggs.Add((col, "mean"));
-                        renameMap.Add(($"{col}_mean", trimmed));
-                    }
-                    else if (trimmed.StartsWith("MIN(", StringComparison.OrdinalIgnoreCase) && trimmed.EndsWith(')'))
-                    {
-                        string col = trimmed.Substring(4, trimmed.Length - 5).Trim();
-                        parsedAggs.Add((col, "min"));
-                        renameMap.Add(($"{col}_min", trimmed));
-                    }
-                    else if (trimmed.StartsWith("MAX(", StringComparison.OrdinalIgnoreCase) && trimmed.EndsWith(')'))
-                    {
-                        string col = trimmed.Substring(4, trimmed.Length - 5).Trim();
-                        parsedAggs.Add((col, "max"));
-                        renameMap.Add(($"{col}_max", trimmed));
-                    }
-                    else
-                    {
-                        parsedAggs.Add((trimmed, "sum"));
-                        renameMap.Add(($"{trimmed}_sum", trimmed));
-                    }
-                }
-
-                DataFrame reducedDf;
-                if (combinedDf.RowCount == 0 || dfs.All(df => df.RowCount == 0))
-                {
-                    reducedDf = CreateEmptyGroupByDataFrame(dfs, groupBy.GroupKeys, parsedAggs, renameMap);
-                }
-                else
-                {
-                    reducedDf = combinedDf.GroupBy(groupBy.GroupKeys).Agg(parsedAggs.ToArray());
-
-                    foreach (var (orig, target) in renameMap)
-                    {
-                        try
-                        {
-                            var c = reducedDf.GetColumn(orig);
-                            c.Rename(target);
-                        }
-                        catch
-                        {
-                        }
-                    }
-                }
-
-                return new List<RefCountedPartitionBuffer>(1)
-                {
-                    PolarisBridge.DataFrameToPartitionBuffer(reducedDf)
-                };
             }
 
             case Glacier.Cluster.Scheduler.LogicalPlan.LogicalHashJoinNode join:
@@ -320,41 +356,35 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
                 var leftBuffers = await ExecutePlanAsync(join.LeftSource, cancellationToken).ConfigureAwait(false);
                 var rightBuffers = await ExecutePlanAsync(join.RightSource, cancellationToken).ConfigureAwait(false);
 
-                var leftDfs = new List<DataFrame>(leftBuffers.Count);
                 try
                 {
+                    var leftDfs = new List<DataFrame>(leftBuffers.Count);
                     foreach (var b in leftBuffers)
                     {
-                        leftDfs.Add(PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: false));
+                        leftDfs.Add(PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: true));
                     }
+
+                    var rightDfs = new List<DataFrame>(rightBuffers.Count);
+                    foreach (var b in rightBuffers)
+                    {
+                        rightDfs.Add(PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: true));
+                    }
+
+                    var leftDf = leftDfs.Count == 1 ? leftDfs[0] : DataFrame.Concat(leftDfs);
+                    var rightDf = rightDfs.Count == 1 ? rightDfs[0] : DataFrame.Concat(rightDfs);
+
+                    var joinedDf = leftDf.Join(rightDf, join.JoinKey, JoinType.Inner);
+
+                    return new List<RefCountedPartitionBuffer>(1)
+                    {
+                        PolarisBridge.DataFrameToPartitionBuffer(joinedDf)
+                    };
                 }
                 finally
                 {
                     foreach (var b in leftBuffers) b.Release();
-                }
-
-                var rightDfs = new List<DataFrame>(rightBuffers.Count);
-                try
-                {
-                    foreach (var b in rightBuffers)
-                    {
-                        rightDfs.Add(PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: false));
-                    }
-                }
-                finally
-                {
                     foreach (var b in rightBuffers) b.Release();
                 }
-
-                var leftDf = leftDfs.Count == 1 ? leftDfs[0] : DataFrame.Concat(leftDfs);
-                var rightDf = rightDfs.Count == 1 ? rightDfs[0] : DataFrame.Concat(rightDfs);
-
-                var joinedDf = leftDf.Join(rightDf, join.JoinKey, JoinType.Inner);
-
-                return new List<RefCountedPartitionBuffer>(1)
-                {
-                    PolarisBridge.DataFrameToPartitionBuffer(joinedDf)
-                };
             }
 
             case Glacier.Cluster.Scheduler.LogicalPlan.LogicalRepartitionNode repartition:
@@ -411,8 +441,10 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
                 if (stage.PrimaryOperator == StageOperatorType.Scan)
                 {
                     string payloadStr = Encoding.UTF8.GetString(stage.OperatorPayload.Span);
-                    string[] parts = payloadStr.Split('|');
-                    string uri = parts[0];
+                    int gbSep = payloadStr.IndexOf("\u001fGROUPBY:", StringComparison.Ordinal);
+                    string scanAndOps = gbSep >= 0 ? payloadStr[..gbSep] : payloadStr;
+                    var parts = PredicateCompiler.SplitPipelinePayload(scanAndOps, '|');
+                    string uri = parts.Count > 0 ? parts[0] : string.Empty;
                     var filterPredicates = parts.Skip(1).Where(p => !string.IsNullOrEmpty(p)).ToList();
 
                     List<RefCountedPartitionBuffer> buffers;
@@ -440,7 +472,7 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
                         for (int i = 0; i < buffers.Count; i++)
                         {
                             var inBuf = buffers[i];
-                            var inDf = PolarisBridge.PartitionBufferToDataFrame(inBuf, zeroCopy: false);
+                            var inDf = PolarisBridge.PartitionBufferToDataFrame(inBuf, zeroCopy: true);
                             inDf = Glacier.Cluster.Worker.TaskExecutor.ApplyFusedOperators(inDf, filterPredicates);
                             var outBuf = PolarisBridge.DataFrameToPartitionBuffer(inDf);
                             inBuf.Release();
@@ -455,13 +487,13 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
                     int parentId = stage.ParentStageIds.First();
                     var parentBuffers = stageOutputs[parentId];
                     string exprStr = Encoding.UTF8.GetString(stage.OperatorPayload.Span);
-                    string[] ops = exprStr.Split('|', StringSplitOptions.RemoveEmptyEntries);
+                    var ops = PredicateCompiler.SplitPipelinePayload(exprStr, '|').Where(p => !string.IsNullOrEmpty(p)).ToArray();
 
                     var outBuffers = new List<RefCountedPartitionBuffer>(parentBuffers.Count);
                     for (int i = 0; i < parentBuffers.Count; i++)
                     {
                         var inBuf = parentBuffers[i];
-                        var inDf = PolarisBridge.PartitionBufferToDataFrame(inBuf, zeroCopy: false);
+                        var inDf = PolarisBridge.PartitionBufferToDataFrame(inBuf, zeroCopy: true);
                         var filteredDf = Glacier.Cluster.Worker.TaskExecutor.ApplyFusedOperators(inDf, ops);
                         outBuffers.Add(PolarisBridge.DataFrameToPartitionBuffer(filteredDf));
                     }
@@ -478,7 +510,7 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
                     for (int i = 0; i < parentBuffers.Count; i++)
                     {
                         var inBuf = parentBuffers[i];
-                        var inDf = PolarisBridge.PartitionBufferToDataFrame(inBuf, zeroCopy: false);
+                        var inDf = PolarisBridge.PartitionBufferToDataFrame(inBuf, zeroCopy: true);
                         var projDf = inDf.Select(cols);
                         outBuffers.Add(PolarisBridge.DataFrameToPartitionBuffer(projDf));
                     }
@@ -491,19 +523,60 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
                     {
                         int parentId = stage.ParentStageIds.First();
                         parentBuffers = stageOutputs[parentId];
+                        var outBuffers = new List<RefCountedPartitionBuffer>(parentBuffers.Count);
+                        foreach (var b in parentBuffers)
+                        {
+                            b.Retain();
+                            outBuffers.Add(b);
+                        }
+                        stageOutputs[stage.StageId] = outBuffers;
                     }
                     else
                     {
-                        parentBuffers = _initialBuffers;
-                    }
+                        string payloadStr = Encoding.UTF8.GetString(stage.OperatorPayload.Span);
+                        int gbSep = payloadStr.IndexOf("\u001fGROUPBY:", StringComparison.Ordinal);
+                        string scanAndOps = gbSep >= 0 ? payloadStr[..gbSep] : string.Empty;
+                        var parts = string.IsNullOrEmpty(scanAndOps)
+                            ? new List<string>()
+                            : PredicateCompiler.SplitPipelinePayload(scanAndOps, '|');
+                        string uri = parts.Count > 0 ? parts[0] : string.Empty;
+                        var filterPredicates = parts.Skip(1).Where(p => !string.IsNullOrEmpty(p)).ToList();
 
-                    var outBuffers = new List<RefCountedPartitionBuffer>(parentBuffers.Count);
-                    foreach (var b in parentBuffers)
-                    {
-                        b.Retain();
-                        outBuffers.Add(b);
+                        List<RefCountedPartitionBuffer> buffers;
+                        if (!string.IsNullOrEmpty(uri) && s_registeredSources.TryGetValue(uri, out var regList) && regList.Count > 0)
+                        {
+                            buffers = new List<RefCountedPartitionBuffer>(regList.Count);
+                            foreach (var b in regList)
+                            {
+                                b.Retain();
+                                buffers.Add(b);
+                            }
+                        }
+                        else
+                        {
+                            buffers = new List<RefCountedPartitionBuffer>(_initialBuffers.Count);
+                            foreach (var b in _initialBuffers)
+                            {
+                                b.Retain();
+                                buffers.Add(b);
+                            }
+                        }
+
+                        if (filterPredicates.Count > 0)
+                        {
+                            for (int i = 0; i < buffers.Count; i++)
+                            {
+                                var inBuf = buffers[i];
+                                var inDf = PolarisBridge.PartitionBufferToDataFrame(inBuf, zeroCopy: true);
+                                inDf = Glacier.Cluster.Worker.TaskExecutor.ApplyFusedOperators(inDf, filterPredicates);
+                                var outBuf = PolarisBridge.DataFrameToPartitionBuffer(inDf);
+                                inBuf.Release();
+                                buffers[i] = outBuf;
+                            }
+                        }
+
+                        stageOutputs[stage.StageId] = buffers;
                     }
-                    stageOutputs[stage.StageId] = outBuffers;
                 }
                 else if (stage.PrimaryOperator == StageOperatorType.GroupByReduce)
                 {
@@ -511,7 +584,9 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
                     var mapBuffers = stageOutputs[mapStageId];
                     var mapStage = dag.Stages[mapStageId];
 
-                    string groupKeysStr = Encoding.UTF8.GetString(mapStage.OperatorPayload.Span);
+                    string rawMapPayload = Encoding.UTF8.GetString(mapStage.OperatorPayload.Span);
+                    int gbSep = rawMapPayload.IndexOf("\u001fGROUPBY:", StringComparison.Ordinal);
+                    string groupKeysStr = gbSep >= 0 ? rawMapPayload[(gbSep + "\u001fGROUPBY:".Length)..] : rawMapPayload;
                     string[] groupKeys = groupKeysStr.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
 
                     string aggsStr = Encoding.UTF8.GetString(stage.OperatorPayload.Span);
@@ -520,7 +595,7 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
                     var dfs = new List<DataFrame>(mapBuffers.Count);
                     foreach (var b in mapBuffers)
                     {
-                        dfs.Add(PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: false));
+                        dfs.Add(PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: true));
                     }
                     var combinedDf = dfs.Count == 1 ? dfs[0] : (dfs.All(df => df.RowCount == 0) ? (dfs.FirstOrDefault(df => df.Columns.Count > 0) ?? new DataFrame()) : DataFrame.Concat(dfs));
 
@@ -582,15 +657,8 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
 
                         foreach (var (orig, target) in renameMap)
                         {
-                            try
-                            {
-                                var c = reducedDf.GetColumn(orig);
-                                c.Rename(target);
-                            }
-                            catch
-                            {
-                                // ignore if column name already matches
-                            }
+                            var col = reducedDf.Columns.FirstOrDefault(c => string.Equals(c.Name, orig, StringComparison.Ordinal));
+                            col?.Rename(target);
                         }
                     }
 
@@ -609,8 +677,8 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
                     var leftBuffers = stageOutputs[leftStageId];
                     var rightBuffers = stageOutputs[rightStageId];
 
-                    var leftDfs = leftBuffers.Select(b => PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: false)).ToList();
-                    var rightDfs = rightBuffers.Select(b => PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: false)).ToList();
+                    var leftDfs = leftBuffers.Select(b => PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: true)).ToList();
+                    var rightDfs = rightBuffers.Select(b => PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: true)).ToList();
 
                     var leftDf = leftDfs.Count == 1 ? leftDfs[0] : DataFrame.Concat(leftDfs);
                     var rightDf = rightDfs.Count == 1 ? rightDfs[0] : DataFrame.Concat(rightDfs);
@@ -627,7 +695,7 @@ public sealed class InMemoryDistributedExecutionContext : IDistributedExecutionC
                 {
                     int parentId = stage.ParentStageIds.First();
                     var parentBuffers = stageOutputs[parentId];
-                    var dfs = parentBuffers.Select(b => PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: false)).ToList();
+                    var dfs = parentBuffers.Select(b => PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: true)).ToList();
                     var combinedDf = dfs.Count == 1
                         ? dfs[0]
                         : (dfs.All(df => df.RowCount == 0)

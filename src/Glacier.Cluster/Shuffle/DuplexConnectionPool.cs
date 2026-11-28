@@ -3,27 +3,38 @@ namespace Glacier.Cluster.Shuffle;
 using System;
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Pipelines;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Glacier.Cluster.Protocol;
 
 /// <summary>
 /// Encapsulates a complete parsed Glacier.Cluster wire frame.
 /// </summary>
-public readonly struct ClusterFrame
+public readonly struct ClusterFrame : IDisposable
 {
     public readonly ClusterFrameHeader Header;
     public readonly ReadOnlyMemory<byte> Payload;
+    private readonly IMemoryOwner<byte>? _owner;
 
     public ClusterFrame(ClusterFrameHeader header, ReadOnlyMemory<byte> payload)
     {
         Header = header;
         Payload = payload;
+        _owner = null;
+    }
+
+    internal ClusterFrame(ClusterFrameHeader header, IMemoryOwner<byte> owner, int length)
+    {
+        Header = header;
+        Payload = owner.Memory.Slice(0, length);
+        _owner = owner;
     }
 
     public ClusterFrame(ClusterFrameHeader header, ReadOnlySequence<byte> payloadSequence)
@@ -32,15 +43,21 @@ public readonly struct ClusterFrame
         if (payloadSequence.IsEmpty)
         {
             Payload = ReadOnlyMemory<byte>.Empty;
-        }
-        else if (payloadSequence.IsSingleSegment)
-        {
-            Payload = payloadSequence.First;
+            _owner = null;
         }
         else
         {
-            Payload = payloadSequence.ToArray();
+            int len = checked((int)payloadSequence.Length);
+            var owner = MemoryPool<byte>.Shared.Rent(len);
+            payloadSequence.CopyTo(owner.Memory.Span);
+            Payload = owner.Memory.Slice(0, len);
+            _owner = owner;
         }
+    }
+
+    public void Dispose()
+    {
+        _owner?.Dispose();
     }
 }
 
@@ -56,8 +73,11 @@ public sealed class DuplexConnection : IAsyncDisposable, IDisposable
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private readonly ConcurrentDictionary<ulong, TaskCompletionSource<ClusterFrame>> _pendingRequests = new();
     private readonly Func<ClusterFrame, ValueTask>? _unsolicitedFrameHandler;
+    private readonly Channel<ClusterFrame>? _unsolicitedChannel;
     private readonly CancellationTokenSource _cts = new();
+    private readonly AsyncLocal<bool> _inInternalLoop = new();
     private Task? _readLoopTask;
+    private Task? _unsolicitedDispatchTask;
     private int _isDisposed;
 
     public Guid RemoteNodeId => _remoteNodeId;
@@ -74,11 +94,24 @@ public sealed class DuplexConnection : IAsyncDisposable, IDisposable
         _duplexPipe = duplexPipe ?? throw new ArgumentNullException(nameof(duplexPipe));
         _underlyingSocket = underlyingSocket;
         _unsolicitedFrameHandler = unsolicitedFrameHandler;
+        if (unsolicitedFrameHandler != null)
+        {
+            _unsolicitedChannel = Channel.CreateBounded<ClusterFrame>(new BoundedChannelOptions(1024)
+            {
+                SingleReader = true,
+                SingleWriter = true,
+                FullMode = BoundedChannelFullMode.Wait
+            });
+        }
     }
 
-    /// <summary>Starts the continuous background read loop.</summary>
+    /// <summary>Starts the continuous background read loop (and unsolicited handler dispatch loop).</summary>
     public void Start()
     {
+        if (_unsolicitedChannel != null && _unsolicitedFrameHandler != null)
+        {
+            _unsolicitedDispatchTask = Task.Run(() => UnsolicitedDispatchLoopAsync(_cts.Token));
+        }
         _readLoopTask = Task.Run(() => ReadLoopAsync(_cts.Token));
     }
 
@@ -164,18 +197,23 @@ public sealed class DuplexConnection : IAsyncDisposable, IDisposable
             throw new InvalidOperationException($"CorrelationId {correlationId} is already in flight for node {_remoteNodeId}.");
         }
 
+        using var timeoutCts = new CancellationTokenSource(timeout);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token, _cts.Token);
+
         try
         {
             await SendFrameAsync(request, correlationId, flags: 0, ct).ConfigureAwait(false);
-
-            using var timeoutCts = new CancellationTokenSource(timeout);
-            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token, _cts.Token);
 
             return await tcs.Task.WaitAsync(linkedCts.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
-            throw new TimeoutException($"Request with CorrelationId {correlationId} to node {_remoteNodeId} timed out after {timeout.TotalMilliseconds}ms.");
+            if (timeoutCts.IsCancellationRequested)
+            {
+                throw new TimeoutException($"Request with CorrelationId {correlationId} to node {_remoteNodeId} timed out after {timeout.TotalMilliseconds}ms.");
+            }
+
+            throw new IOException($"Connection to peer {_remoteNodeId} closed before response for CorrelationId {correlationId} was received.");
         }
         finally
         {
@@ -185,6 +223,7 @@ public sealed class DuplexConnection : IAsyncDisposable, IDisposable
 
     private async Task ReadLoopAsync(CancellationToken ct)
     {
+        _inInternalLoop.Value = true;
         PipeReader reader = _duplexPipe.Input;
 
         try
@@ -196,16 +235,51 @@ public sealed class DuplexConnection : IAsyncDisposable, IDisposable
 
                 while (ClusterFrameReader.TryReadFrame(ref buffer, out ClusterFrameHeader header, out ReadOnlySequence<byte> payload))
                 {
-                    // Copy payload to ensure thread-safe longevity past AdvanceTo
-                    var frame = new ClusterFrame(header, payload.ToArray());
+                    uint computedCrc = ClusterCrc32.Compute(in payload);
+                    if (computedCrc != header.PayloadCrc32)
+                    {
+                        throw new InvalidDataException(
+                            $"Frame CRC32 mismatch on {header.MessageType}: expected 0x{header.PayloadCrc32:X8}, computed 0x{computedCrc:X8}.");
+                    }
+
+                    ClusterFrame frame;
+                    if (payload.IsEmpty)
+                    {
+                        frame = new ClusterFrame(header, ReadOnlyMemory<byte>.Empty);
+                    }
+                    else
+                    {
+                        int len = checked((int)payload.Length);
+                        var owner = MemoryPool<byte>.Shared.Rent(len);
+                        payload.CopyTo(owner.Memory.Span);
+                        frame = new ClusterFrame(header, owner, len);
+                    }
 
                     if (_pendingRequests.TryRemove(header.CorrelationId, out var tcs))
                     {
-                        tcs.TrySetResult(frame);
+                        if (!tcs.TrySetResult(frame))
+                        {
+                            frame.Dispose();
+                        }
                     }
-                    else if (_unsolicitedFrameHandler != null)
+                    else if (_unsolicitedChannel != null)
                     {
-                        await _unsolicitedFrameHandler(frame).ConfigureAwait(false);
+                        try
+                        {
+                            if (!_unsolicitedChannel.Writer.TryWrite(frame))
+                            {
+                                await _unsolicitedChannel.Writer.WriteAsync(frame, ct).ConfigureAwait(false);
+                            }
+                        }
+                        catch
+                        {
+                            frame.Dispose();
+                            throw;
+                        }
+                    }
+                    else
+                    {
+                        frame.Dispose();
                     }
                 }
 
@@ -228,7 +302,54 @@ public sealed class DuplexConnection : IAsyncDisposable, IDisposable
         }
         finally
         {
+            // Fault any remaining pending requests if the reader completed (EOF) without a response.
+            foreach (var kvp in _pendingRequests)
+            {
+                kvp.Value.TrySetException(new IOException($"Connection to peer {_remoteNodeId} closed before response was received."));
+            }
+            _pendingRequests.Clear();
+
+            _unsolicitedChannel?.Writer.TryComplete();
             await DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    private async Task UnsolicitedDispatchLoopAsync(CancellationToken ct)
+    {
+        _inInternalLoop.Value = true;
+        if (_unsolicitedChannel == null || _unsolicitedFrameHandler == null) return;
+
+        try
+        {
+            await foreach (var frame in _unsolicitedChannel.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+            {
+                using (frame)
+                {
+                    try
+                    {
+                        await _unsolicitedFrameHandler(frame).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        Trace.TraceWarning($"[DuplexConnection] Unsolicited frame handler error for peer {_remoteNodeId}: {ex.Message}");
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Graceful shutdown
+        }
+        finally
+        {
+            while (_unsolicitedChannel.Reader.TryRead(out var leftover))
+            {
+                leftover.Dispose();
+            }
         }
     }
 
@@ -238,25 +359,30 @@ public sealed class DuplexConnection : IAsyncDisposable, IDisposable
             return;
 
         _cts.Cancel();
+        _unsolicitedChannel?.Writer.TryComplete();
 
         try
         {
             await _duplexPipe.Output.CompleteAsync().ConfigureAwait(false);
             await _duplexPipe.Input.CompleteAsync().ConfigureAwait(false);
         }
-        catch { /* Ignore pipe shutdown errors */ }
+        catch (Exception ex)
+        {
+            Trace.TraceWarning($"[DuplexConnection] Pipe shutdown warning for peer {_remoteNodeId}: {ex.Message}");
+        }
 
         if (_duplexPipe is IAsyncDisposable asyncDisposablePipe)
         {
-            try { await asyncDisposablePipe.DisposeAsync().ConfigureAwait(false); } catch { }
+            try { await asyncDisposablePipe.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception ex) { Trace.TraceWarning($"[DuplexConnection] Async pipe dispose warning: {ex.Message}"); }
         }
         else if (_duplexPipe is IDisposable disposablePipe)
         {
-            try { disposablePipe.Dispose(); } catch { }
+            try { disposablePipe.Dispose(); }
+            catch (Exception ex) { Trace.TraceWarning($"[DuplexConnection] Pipe dispose warning: {ex.Message}"); }
         }
 
         _underlyingSocket?.Dispose();
-        _writeLock.Dispose();
 
         // Fault any remaining pending requests
         foreach (var kvp in _pendingRequests)
@@ -265,17 +391,50 @@ public sealed class DuplexConnection : IAsyncDisposable, IDisposable
         }
         _pendingRequests.Clear();
 
-        if (_readLoopTask != null)
+        if (!_inInternalLoop.Value)
         {
-            try { await _readLoopTask.ConfigureAwait(false); } catch { }
+            if (_readLoopTask != null)
+            {
+                try { await _readLoopTask.ConfigureAwait(false); }
+                catch (OperationCanceledException) { }
+            }
+            if (_unsolicitedDispatchTask != null)
+            {
+                try { await _unsolicitedDispatchTask.ConfigureAwait(false); }
+                catch (OperationCanceledException) { }
+            }
         }
 
+        _writeLock.Dispose();
         _cts.Dispose();
     }
 
     public void Dispose()
     {
-        DisposeAsync().AsTask().GetAwaiter().GetResult();
+        if (Interlocked.Exchange(ref _isDisposed, 1) != 0)
+            return;
+
+        _cts.Cancel();
+        _unsolicitedChannel?.Writer.TryComplete();
+
+        try { _duplexPipe.Output.Complete(); } catch (Exception ex) { Trace.TraceWarning($"[DuplexConnection] Output complete warning: {ex.Message}"); }
+        try { _duplexPipe.Input.Complete(); } catch (Exception ex) { Trace.TraceWarning($"[DuplexConnection] Input complete warning: {ex.Message}"); }
+
+        if (_duplexPipe is IDisposable disposablePipe)
+        {
+            try { disposablePipe.Dispose(); } catch (Exception ex) { Trace.TraceWarning($"[DuplexConnection] Pipe dispose warning: {ex.Message}"); }
+        }
+
+        _underlyingSocket?.Dispose();
+
+        foreach (var kvp in _pendingRequests)
+        {
+            kvp.Value.TrySetException(new ObjectDisposedException(nameof(DuplexConnection)));
+        }
+        _pendingRequests.Clear();
+
+        _writeLock.Dispose();
+        _cts.Dispose();
     }
 }
 
@@ -447,6 +606,19 @@ public sealed class DuplexConnectionPool : IAsyncDisposable, IDisposable
 
     public void Dispose()
     {
-        DisposeAsync().AsTask().GetAwaiter().GetResult();
+        if (Interlocked.Exchange(ref _isDisposed, 1) != 0)
+            return;
+
+        foreach (var kvp in _activeConnections)
+        {
+            kvp.Value.Dispose();
+        }
+        _activeConnections.Clear();
+
+        foreach (var kvp in _connectionLocks)
+        {
+            kvp.Value.Dispose();
+        }
+        _connectionLocks.Clear();
     }
 }

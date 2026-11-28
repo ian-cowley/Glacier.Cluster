@@ -335,17 +335,29 @@ public sealed class NonBlockingDuplexSocketBus : IDisposable, IAsyncDisposable
                 _socket.Shutdown(SocketShutdown.Both);
             }
         }
-        catch { }
+        catch (SocketException ex)
+        {
+            System.Diagnostics.Trace.TraceInformation($"[NonBlockingDuplexSocketBus] Socket shutdown warning: {ex.Message}");
+        }
+        catch (ObjectDisposedException)
+        {
+            // Already disposed
+        }
 
         try { _socket.Close(); }
-        catch { }
+        catch (Exception ex) when (ex is SocketException or ObjectDisposedException)
+        {
+            System.Diagnostics.Trace.TraceInformation($"[NonBlockingDuplexSocketBus] Socket close warning: {ex.Message}");
+        }
     }
 
     private void CleanupKernelPrimitivesOnce()
     {
         if (Interlocked.Exchange(ref _resourcesCleaned, 1) != 0) return;
-        try { _cts.Dispose(); } catch { }
-        try { _sendLock.Dispose(); } catch { }
+        try { _cts.Dispose(); }
+        catch (ObjectDisposedException) { }
+        try { _sendLock.Dispose(); }
+        catch (ObjectDisposedException) { }
     }
 
     public void Dispose()
@@ -380,7 +392,11 @@ public sealed class NonBlockingDuplexSocketBus : IDisposable, IAsyncDisposable
         if (receiveTask != null)
         {
             try { await receiveTask.ConfigureAwait(false); }
-            catch { }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[NonBlockingDuplexSocketBus] Receive loop teardown warning: {ex.Message}");
+            }
         }
 
         CleanupKernelPrimitivesOnce();

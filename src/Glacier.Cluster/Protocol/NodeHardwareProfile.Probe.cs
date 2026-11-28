@@ -2,6 +2,7 @@ namespace Glacier.Cluster.Protocol;
 
 using System;
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
@@ -11,6 +12,8 @@ using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.X86;
+using Glacier.Inference.Gpu;
+using Glacier.Inference.Gpu.D3D12;
 
 public partial struct NodeHardwareProfile
 {
@@ -172,11 +175,11 @@ public partial struct NodeHardwareProfile
         return ulong.TryParse(valStr, out ulong kb) ? kb : 0;
     }
 
-    [DllImport("kernel32.dll", SetLastError = true)]
+    [LibraryImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
+    private static partial bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
 
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    [StructLayout(LayoutKind.Sequential)]
     private struct MEMORYSTATUSEX
     {
         public uint dwLength;
@@ -299,16 +302,16 @@ public partial struct NodeHardwareProfile
                         }
                     }
 
-                    // Device exists even if memory query fails
-                    totalVram = 4UL * 1024 * 1024 * 1024;
-                    availVram = 3UL * 1024 * 1024 * 1024;
+                    // Device enumerated, but VRAM query symbol/call unavailable: report honest 0 instead of fabricated size
+                    totalVram = 0;
+                    availVram = 0;
                     return true;
                 }
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // Silently handle any CUDA driver interop failure
+            Trace.TraceWarning($"[NodeHardwareProfile] CUDA interop probe warning: {ex.Message}");
         }
         finally
         {
@@ -363,15 +366,15 @@ public partial struct NodeHardwareProfile
                         }
                     }
 
-                    totalVram = 4UL * 1024 * 1024 * 1024;
-                    availVram = 3UL * 1024 * 1024 * 1024;
+                    totalVram = 0;
+                    availVram = 0;
                     return true;
                 }
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // Silently handle ROCm error
+            Trace.TraceWarning($"[NodeHardwareProfile] ROCm interop probe warning: {ex.Message}");
         }
         finally
         {
@@ -386,21 +389,36 @@ public partial struct NodeHardwareProfile
         totalVram = 0;
         availVram = 0;
 
-        if (!NativeLibrary.TryLoad("d3d12.dll", out IntPtr d3d12Handle))
+        if (!OperatingSystem.IsWindows())
             return false;
 
-        NativeLibrary.Free(d3d12Handle);
+        try
+        {
+            var adapters = D3D12Context.EnumerateAdapters();
+            if (adapters.Count == 0)
+                return false;
 
-        if (!NativeLibrary.TryLoad("dxgi.dll", out IntPtr dxgiHandle))
+            ulong bestVram = 0;
+            foreach (var adapter in adapters)
+            {
+                ulong effective = adapter.DedicatedVideoMemory > 0
+                    ? adapter.DedicatedVideoMemory
+                    : adapter.SharedSystemMemory;
+                if (effective > bestVram)
+                {
+                    bestVram = effective;
+                }
+            }
+
+            totalVram = bestVram;
+            availVram = (ulong)(bestVram * 0.90);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Trace.TraceWarning($"[NodeHardwareProfile] D3D12 DXGI probe warning: {ex.Message}");
             return false;
-
-        NativeLibrary.Free(dxgiHandle);
-
-        // Direct3D 12 and DXGI libraries are present and operational on Windows
-        // Default estimate if not queried via full COM interface
-        totalVram = 4UL * 1024 * 1024 * 1024;
-        availVram = 3UL * 1024 * 1024 * 1024;
-        return true;
+        }
     }
 
     private static bool TryProbeVulkan(out ulong totalVram, out ulong availVram)
@@ -408,37 +426,30 @@ public partial struct NodeHardwareProfile
         totalVram = 0;
         availVram = 0;
 
-        string libName = OperatingSystem.IsWindows() ? "vulkan-1.dll" :
-                         OperatingSystem.IsMacOS() ? "libMoltenVK.dylib" : "libvulkan.so.1";
-
-        if (!NativeLibrary.TryLoad(libName, out IntPtr handle))
-        {
-            if (OperatingSystem.IsLinux() && !NativeLibrary.TryLoad("libvulkan.so", out handle))
-            {
-                return false;
-            }
-            if (handle == IntPtr.Zero) return false;
-        }
-
         try
         {
-            if (NativeLibrary.TryGetExport(handle, "vkGetInstanceProcAddr", out _))
-            {
-                totalVram = 4UL * 1024 * 1024 * 1024;
-                availVram = 3UL * 1024 * 1024 * 1024;
-                return true;
-            }
-        }
-        catch
-        {
-            // Silently handle Vulkan error
-        }
-        finally
-        {
-            NativeLibrary.Free(handle);
-        }
+            var devices = VulkanContext.EnumerateDevices();
+            if (devices.Count == 0)
+                return false;
 
-        return false;
+            ulong bestVram = 0;
+            foreach (var dev in devices)
+            {
+                if (dev.TotalMemoryBytes > bestVram)
+                {
+                    bestVram = dev.TotalMemoryBytes;
+                }
+            }
+
+            totalVram = bestVram;
+            availVram = (ulong)(bestVram * 0.90);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Trace.TraceWarning($"[NodeHardwareProfile] Vulkan device probe warning: {ex.Message}");
+            return false;
+        }
     }
 
     private static bool TryProbeMetal(out ulong totalVram, out ulong availVram)
@@ -452,8 +463,9 @@ public partial struct NodeHardwareProfile
         if (NativeLibrary.TryLoad("/System/Library/Frameworks/Metal.framework/Metal", out IntPtr handle))
         {
             NativeLibrary.Free(handle);
-            totalVram = 8UL * 1024 * 1024 * 1024;
-            availVram = 6UL * 1024 * 1024 * 1024;
+            // Without Objective-C MTLCreateSystemDefaultDevice memory query, report 0 instead of stubbed constant.
+            totalVram = 0;
+            availVram = 0;
             return true;
         }
 
@@ -465,48 +477,67 @@ public partial struct NodeHardwareProfile
         try
         {
             var interfaces = NetworkInterface.GetAllNetworkInterfaces();
+            uint? gatewayPrivateIpv4 = null;
+            uint? anyGatewayIpv4 = null;
+            uint? rfc1918Ipv4 = null;
+            uint? fallbackIpv4 = null;
 
-            // Pass 1: Look for operational physical Ethernet / Wi-Fi on 192.168.1.x subnet
             foreach (var ni in interfaces)
             {
                 if (ni.OperationalStatus != OperationalStatus.Up)
                     continue;
-                if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback)
+                if (ni.NetworkInterfaceType is NetworkInterfaceType.Loopback or NetworkInterfaceType.Tunnel)
                     continue;
 
-                foreach (var ua in ni.GetIPProperties().UnicastAddresses)
+                var ipProps = ni.GetIPProperties();
+                bool hasGateway = ipProps.GatewayAddresses.Count > 0;
+
+                foreach (var ua in ipProps.UnicastAddresses)
                 {
-                    if (ua.Address.AddressFamily == AddressFamily.InterNetwork)
+                    if (ua.Address.AddressFamily != AddressFamily.InterNetwork)
+                        continue;
+
+                    byte[] bytes = ua.Address.GetAddressBytes();
+                    // Skip APIPA (169.254.x.x) and loopback (127.x.x.x)
+                    if ((bytes[0] == 169 && bytes[1] == 254) || bytes[0] == 127)
+                        continue;
+
+                    uint addr = BinaryPrimitives.ReadUInt32BigEndian(bytes);
+                    bool isPrivate = bytes[0] == 10 ||
+                                     (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31) ||
+                                     (bytes[0] == 192 && bytes[1] == 168) ||
+                                     (bytes[0] == 100 && bytes[1] >= 64 && bytes[1] <= 127);
+
+                    if (hasGateway)
                     {
-                        byte[] bytes = ua.Address.GetAddressBytes();
-                        if (bytes[0] == 192 && bytes[1] == 168 && bytes[2] == 1)
+                        if (isPrivate)
                         {
-                            return BinaryPrimitives.ReadUInt32BigEndian(bytes);
+                            gatewayPrivateIpv4 ??= addr;
+                        }
+                        else
+                        {
+                            anyGatewayIpv4 ??= addr;
                         }
                     }
-                }
-            }
-
-            // Pass 2: Any operational non-loopback IPv4 address
-            foreach (var ni in interfaces)
-            {
-                if (ni.OperationalStatus != OperationalStatus.Up)
-                    continue;
-                if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback)
-                    continue;
-
-                foreach (var ua in ni.GetIPProperties().UnicastAddresses)
-                {
-                    if (ua.Address.AddressFamily == AddressFamily.InterNetwork)
+                    else if (isPrivate)
                     {
-                        return BinaryPrimitives.ReadUInt32BigEndian(ua.Address.GetAddressBytes());
+                        rfc1918Ipv4 ??= addr;
+                    }
+                    else
+                    {
+                        fallbackIpv4 ??= addr;
                     }
                 }
             }
+
+            if (gatewayPrivateIpv4.HasValue) return gatewayPrivateIpv4.Value;
+            if (anyGatewayIpv4.HasValue) return anyGatewayIpv4.Value;
+            if (rfc1918Ipv4.HasValue) return rfc1918Ipv4.Value;
+            if (fallbackIpv4.HasValue) return fallbackIpv4.Value;
         }
-        catch
+        catch (NetworkInformationException ex)
         {
-            // Silently ignore network enumeration errors
+            Trace.TraceWarning($"[NodeHardwareProfile] Network interface enumeration warning: {ex.Message}");
         }
 
         // Loopback 127.0.0.1 default

@@ -3,12 +3,14 @@ namespace Glacier.Cluster.Compute;
 using System;
 using System.Buffers;
 using System.Buffers.Binary;
+using System.IO;
 using System.IO.Pipelines;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Cluster.Protocol;
 using Glacier.Cluster.Shuffle;
+using Glacier.Cluster.Transport;
 
 /// <summary>
 /// Executes the 2(N-1) communication step Ring AllReduce algorithm on a local node.
@@ -23,6 +25,7 @@ public sealed class RingAllReduceWorker : IAsyncDisposable
     private readonly IDuplexPipe _predecessorPipe;
     private readonly int[] _chunkOffsets;
     private readonly int[] _chunkLengths;
+    private readonly bool _enableCompression;
 
     public Guid LocalNodeId => _localNodeId;
     public int Rank => _rank;
@@ -34,13 +37,22 @@ public sealed class RingAllReduceWorker : IAsyncDisposable
         int worldSize,
         IDuplexPipe successorPipe,
         IDuplexPipe predecessorPipe,
-        int totalElements)
+        int totalElements,
+        bool enableCompression = false)
     {
+        if (worldSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(worldSize), "WorldSize must be greater than 0.");
+        if (rank < 0 || rank >= worldSize)
+            throw new ArgumentOutOfRangeException(nameof(rank), $"Rank ({rank}) must be in [0, {worldSize}).");
+        if (totalElements < 0)
+            throw new ArgumentOutOfRangeException(nameof(totalElements), "TotalElements cannot be negative.");
+
         _localNodeId = localNodeId;
         _rank = rank;
         _worldSize = worldSize;
         _successorPipe = successorPipe ?? throw new ArgumentNullException(nameof(successorPipe));
         _predecessorPipe = predecessorPipe ?? throw new ArgumentNullException(nameof(predecessorPipe));
+        _enableCompression = enableCompression;
 
         _chunkOffsets = new int[worldSize];
         _chunkLengths = new int[worldSize];
@@ -99,6 +111,7 @@ public sealed class RingAllReduceWorker : IAsyncDisposable
                 phase: 0, // Scatter-Reduce
                 sendChunkIdx,
                 sendSlice,
+                _enableCompression,
                 cancellationToken);
 
             Task recvTask = ReceiveAndReduceChunkAsync(
@@ -131,6 +144,7 @@ public sealed class RingAllReduceWorker : IAsyncDisposable
                 phase: 1, // AllGather
                 sendChunkIdx,
                 sendSlice,
+                _enableCompression,
                 cancellationToken);
 
             Task recvTask = ReceiveAndCopyChunkAsync(
@@ -153,45 +167,85 @@ public sealed class RingAllReduceWorker : IAsyncDisposable
         byte phase,
         int chunkIdx,
         Memory<float> data,
+        bool enableCompression,
         CancellationToken ct)
     {
         int elementCount = data.Length;
-        int payloadBytes = 32 + (elementCount * sizeof(float));
-        int totalFrameSize = ClusterFrameHeader.HeaderSize + payloadBytes;
+        int rawFloatBytes = elementCount * sizeof(float);
+        int payloadDataBytes = rawFloatBytes;
+        ClusterFrameFlags flags = ClusterFrameFlags.None;
+        byte[]? compressedRented = null;
 
-        Memory<byte> memory = writer.GetMemory(totalFrameSize);
-        Span<byte> span = memory.Span;
-
-        // Pack payload
-        Span<byte> payloadSpan = span.Slice(ClusterFrameHeader.HeaderSize, payloadBytes);
-        sessionId.TryWriteBytes(payloadSpan.Slice(0, 16));
-        BinaryPrimitives.WriteInt32LittleEndian(payloadSpan.Slice(16, 4), step);
-        payloadSpan[20] = phase;
-        payloadSpan[21] = 0;
-        payloadSpan[22] = 0;
-        payloadSpan[23] = 0;
-        BinaryPrimitives.WriteInt32LittleEndian(payloadSpan.Slice(24, 4), chunkIdx);
-        BinaryPrimitives.WriteInt32LittleEndian(payloadSpan.Slice(28, 4), elementCount);
-
-        if (elementCount > 0)
+        if (enableCompression && rawFloatBytes >= 64)
         {
-            ReadOnlySpan<byte> floatBytes = MemoryMarshal.AsBytes(data.Span);
-            floatBytes.CopyTo(payloadSpan.Slice(32, floatBytes.Length));
+            int maxCompressed = ClusterBlockCodec.GetMaxCompressedLength(rawFloatBytes);
+            compressedRented = ArrayPool<byte>.Shared.Rent(maxCompressed);
+            int compLen = ClusterBlockCodec.Compress(MemoryMarshal.AsBytes(data.Span), compressedRented.AsSpan(0, maxCompressed));
+            if (compLen > 0 && compLen < rawFloatBytes)
+            {
+                payloadDataBytes = compLen;
+                flags = ClusterFrameFlags.Compressed;
+            }
+            else
+            {
+                ArrayPool<byte>.Shared.Return(compressedRented);
+                compressedRented = null;
+            }
         }
 
-        uint crc = ClusterCrc32.Compute(payloadSpan);
-        var header = new ClusterFrameHeader(
-            ClusterMessageType.RingAllReduceStep,
-            correlationId: (ulong)step,
-            payloadLength: (ulong)payloadBytes,
-            crc32: crc,
-            flags: ClusterFrameFlags.None);
-        header.WriteTo(span.Slice(0, ClusterFrameHeader.HeaderSize));
+        try
+        {
+            int payloadBytes = 32 + payloadDataBytes;
+            int totalFrameSize = ClusterFrameHeader.HeaderSize + payloadBytes;
 
-        writer.Advance(totalFrameSize);
-        FlushResult flush = await writer.FlushAsync(ct).ConfigureAwait(false);
-        if (flush.IsCanceled || flush.IsCompleted)
-            throw new InvalidOperationException("PipeWriter completed or cancelled while sending chunk.");
+            Memory<byte> memory = writer.GetMemory(totalFrameSize);
+            Span<byte> span = memory.Span;
+
+            // Pack payload
+            Span<byte> payloadSpan = span.Slice(ClusterFrameHeader.HeaderSize, payloadBytes);
+            sessionId.TryWriteBytes(payloadSpan.Slice(0, 16));
+            BinaryPrimitives.WriteInt32LittleEndian(payloadSpan.Slice(16, 4), step);
+            payloadSpan[20] = phase;
+            payloadSpan[21] = 0;
+            payloadSpan[22] = 0;
+            payloadSpan[23] = 0;
+            BinaryPrimitives.WriteInt32LittleEndian(payloadSpan.Slice(24, 4), chunkIdx);
+            BinaryPrimitives.WriteInt32LittleEndian(payloadSpan.Slice(28, 4), elementCount);
+
+            if (payloadDataBytes > 0)
+            {
+                if (compressedRented != null)
+                {
+                    compressedRented.AsSpan(0, payloadDataBytes).CopyTo(payloadSpan.Slice(32, payloadDataBytes));
+                }
+                else
+                {
+                    ReadOnlySpan<byte> floatBytes = MemoryMarshal.AsBytes(data.Span);
+                    floatBytes.CopyTo(payloadSpan.Slice(32, floatBytes.Length));
+                }
+            }
+
+            uint crc = ClusterCrc32.Compute(payloadSpan);
+            var header = new ClusterFrameHeader(
+                ClusterMessageType.RingAllReduceStep,
+                correlationId: (ulong)step,
+                payloadLength: (ulong)payloadBytes,
+                crc32: crc,
+                flags: flags);
+            header.WriteTo(span.Slice(0, ClusterFrameHeader.HeaderSize));
+
+            writer.Advance(totalFrameSize);
+            FlushResult flush = await writer.FlushAsync(ct).ConfigureAwait(false);
+            if (flush.IsCanceled || flush.IsCompleted)
+                throw new InvalidOperationException("PipeWriter completed or cancelled while sending chunk.");
+        }
+        finally
+        {
+            if (compressedRented != null)
+            {
+                ArrayPool<byte>.Shared.Return(compressedRented);
+            }
+        }
     }
 
     private static async Task ReceiveAndReduceChunkAsync(
@@ -212,18 +266,30 @@ public sealed class RingAllReduceWorker : IAsyncDisposable
             {
                 if (header.MessageType == ClusterMessageType.RingAllReduceStep)
                 {
-                    Span<byte> metaSpan = stackalloc byte[32];
-                    payload.Slice(0, 32).CopyTo(metaSpan);
-
-                    int elementCount = BinaryPrimitives.ReadInt32LittleEndian(metaSpan.Slice(28, 4));
+                    int elementCount = ValidateAndParseStepHeader(
+                        in header,
+                        in payload,
+                        expectedSessionId,
+                        expectedStep,
+                        expectedPhase,
+                        expectedChunkIdx,
+                        targetChunk.Length);
 
                     if (elementCount > 0)
                     {
-                        ReadOnlySequence<byte> floatSeq = payload.Slice(32, elementCount * sizeof(float));
                         using var tempOwner = MemoryPool<float>.Shared.Rent(elementCount);
                         Span<float> tempSpan = tempOwner.Memory.Span.Slice(0, elementCount);
                         Span<byte> tempByteSpan = MemoryMarshal.AsBytes(tempSpan);
-                        floatSeq.CopyTo(tempByteSpan);
+                        ReadOnlySequence<byte> dataSeq = payload.Slice(32);
+
+                        if (header.FrameFlags.HasFlag(ClusterFrameFlags.Compressed))
+                        {
+                            DecompressFloatSequence(in dataSeq, tempByteSpan);
+                        }
+                        else
+                        {
+                            dataSeq.Slice(0, elementCount * sizeof(float)).CopyTo(tempByteSpan);
+                        }
 
                         VectorReductionKernels.AddInPlace(targetChunk.Span, tempSpan);
                     }
@@ -257,16 +323,28 @@ public sealed class RingAllReduceWorker : IAsyncDisposable
             {
                 if (header.MessageType == ClusterMessageType.RingAllReduceStep)
                 {
-                    Span<byte> metaSpan = stackalloc byte[32];
-                    payload.Slice(0, 32).CopyTo(metaSpan);
-
-                    int elementCount = BinaryPrimitives.ReadInt32LittleEndian(metaSpan.Slice(28, 4));
+                    int elementCount = ValidateAndParseStepHeader(
+                        in header,
+                        in payload,
+                        expectedSessionId,
+                        expectedStep,
+                        expectedPhase,
+                        expectedChunkIdx,
+                        targetChunk.Length);
 
                     if (elementCount > 0)
                     {
-                        ReadOnlySequence<byte> floatSeq = payload.Slice(32, elementCount * sizeof(float));
                         Span<byte> targetBytes = MemoryMarshal.AsBytes(targetChunk.Span);
-                        floatSeq.CopyTo(targetBytes);
+                        ReadOnlySequence<byte> dataSeq = payload.Slice(32);
+
+                        if (header.FrameFlags.HasFlag(ClusterFrameFlags.Compressed))
+                        {
+                            DecompressFloatSequence(in dataSeq, targetBytes);
+                        }
+                        else
+                        {
+                            dataSeq.Slice(0, elementCount * sizeof(float)).CopyTo(targetBytes);
+                        }
                     }
 
                     reader.AdvanceTo(buffer.Start, buffer.Start);
@@ -277,6 +355,97 @@ public sealed class RingAllReduceWorker : IAsyncDisposable
             reader.AdvanceTo(buffer.Start, buffer.End);
             if (result.IsCompleted)
                 throw new InvalidOperationException("PipeReader completed before expected frame arrived.");
+        }
+    }
+
+    private static int ValidateAndParseStepHeader(
+        in ClusterFrameHeader header,
+        in ReadOnlySequence<byte> payload,
+        Guid expectedSessionId,
+        int expectedStep,
+        byte expectedPhase,
+        int expectedChunkIdx,
+        int expectedElementCount)
+    {
+        uint computedCrc = ClusterCrc32.Compute(in payload);
+        if (computedCrc != header.PayloadCrc32)
+        {
+            throw new InvalidDataException(
+                $"RingAllReduce frame CRC32 mismatch: expected 0x{header.PayloadCrc32:X8}, computed 0x{computedCrc:X8}.");
+        }
+
+        if (payload.Length < 32)
+        {
+            throw new InvalidDataException(
+                $"RingAllReduce step payload truncated ({payload.Length} bytes < 32-byte header).");
+        }
+
+        Span<byte> metaSpan = stackalloc byte[32];
+        payload.Slice(0, 32).CopyTo(metaSpan);
+
+        Guid sessionId = new Guid(metaSpan.Slice(0, 16));
+        if (sessionId != expectedSessionId)
+        {
+            throw new InvalidDataException(
+                $"RingAllReduce SessionId mismatch: expected {expectedSessionId}, got {sessionId}.");
+        }
+
+        int step = BinaryPrimitives.ReadInt32LittleEndian(metaSpan.Slice(16, 4));
+        if (step != expectedStep)
+        {
+            throw new InvalidDataException(
+                $"RingAllReduce Step mismatch: expected {expectedStep}, got {step}.");
+        }
+
+        byte phase = metaSpan[20];
+        if (phase != expectedPhase)
+        {
+            throw new InvalidDataException(
+                $"RingAllReduce Phase mismatch: expected {expectedPhase}, got {phase}.");
+        }
+
+        int chunkIdx = BinaryPrimitives.ReadInt32LittleEndian(metaSpan.Slice(24, 4));
+        if (chunkIdx != expectedChunkIdx)
+        {
+            throw new InvalidDataException(
+                $"RingAllReduce ChunkIndex mismatch: expected {expectedChunkIdx}, got {chunkIdx}.");
+        }
+
+        int elementCount = BinaryPrimitives.ReadInt32LittleEndian(metaSpan.Slice(28, 4));
+        if (elementCount < 0 || elementCount != expectedElementCount)
+        {
+            throw new InvalidDataException(
+                $"RingAllReduce element count mismatch: expected {expectedElementCount}, got {elementCount}.");
+        }
+
+        bool isCompressed = header.FrameFlags.HasFlag(ClusterFrameFlags.Compressed);
+        long requiredBytes = isCompressed ? 33L : 32L + (long)elementCount * sizeof(float);
+        if (elementCount > 0 && payload.Length < requiredBytes)
+        {
+            throw new InvalidDataException(
+                $"RingAllReduce payload length ({payload.Length} bytes) smaller than required ({requiredBytes} bytes).");
+        }
+
+        return elementCount;
+    }
+
+    private static void DecompressFloatSequence(in ReadOnlySequence<byte> compressedSeq, Span<byte> destinationBytes)
+    {
+        int compLen = checked((int)compressedSeq.Length);
+        byte[] rented = ArrayPool<byte>.Shared.Rent(compLen);
+        try
+        {
+            compressedSeq.CopyTo(rented);
+            int decoded = ClusterBlockCodec.Decompress(rented.AsSpan(0, compLen), destinationBytes);
+            if (decoded != destinationBytes.Length)
+            {
+                throw new InvalidDataException(
+                    $"RingAllReduce compressed payload decompressed to {decoded} bytes, expected {destinationBytes.Length}.");
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
         }
     }
 

@@ -1,6 +1,7 @@
 namespace Glacier.Cluster.Coordinator;
 
 using System;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -13,10 +14,14 @@ public enum ConsensusRole : byte
 
 public readonly struct LeaderLease
 {
+    [JsonInclude]
     public readonly Guid LeaderId;
+    [JsonInclude]
     public readonly ulong Epoch;
+    [JsonInclude]
     public readonly DateTimeOffset ExpiryUtc;
 
+    [JsonConstructor]
     public LeaderLease(Guid leaderId, ulong epoch, DateTimeOffset expiryUtc)
     {
         LeaderId = leaderId;
@@ -24,6 +29,7 @@ public readonly struct LeaderLease
         ExpiryUtc = expiryUtc;
     }
 
+    [JsonIgnore]
     public bool IsExpired => DateTimeOffset.UtcNow >= ExpiryUtc;
 }
 
@@ -53,9 +59,11 @@ public sealed class ActiveStandbyConsensusLedger : IAsyncDisposable, IDisposable
     public Guid LocalCoordinatorId => _localCoordinatorId;
     public ConsensusRole CurrentRole => _currentRole;
     public LeaderLease CurrentLease { get { lock (_leaseLock) return _currentLease; } }
+    public ulong CurrentEpoch { get { lock (_leaseLock) return _currentLease.Epoch; } }
 
     public event Action? PromotedToActive;
     public event Action? DemotedToStandby;
+    public event Action<LeaderLease>? LeaseRenewed;
 
     public ActiveStandbyConsensusLedger(
         Guid localCoordinatorId,
@@ -88,29 +96,53 @@ public sealed class ActiveStandbyConsensusLedger : IAsyncDisposable, IDisposable
     {
         if (_currentRole != ConsensusRole.Active) return false;
 
+        LeaderLease renewed;
         lock (_leaseLock)
         {
-            _currentLease = new LeaderLease(
+            if (_currentRole != ConsensusRole.Active) return false;
+            renewed = new LeaderLease(
                 _localCoordinatorId,
                 _currentLease.Epoch,
                 DateTimeOffset.UtcNow.Add(_options.LeaseDuration));
-            return true;
+            _currentLease = renewed;
         }
+
+        LeaseRenewed?.Invoke(renewed);
+        return true;
+    }
+
+    public void UpdateLeaderLeaseFromRemote(Guid leaderId, ulong epoch, long remainingLeaseMs)
+    {
+        long clampedMs = Math.Max(0, remainingLeaseMs);
+        UpdateLeaderLeaseFromRemote(leaderId, epoch, DateTimeOffset.UtcNow.AddMilliseconds(clampedMs));
     }
 
     public void UpdateLeaderLeaseFromRemote(Guid leaderId, ulong epoch, DateTimeOffset expiryUtc)
     {
+        if (leaderId == Guid.Empty) return;
+
+        bool shouldDemote = false;
         lock (_leaseLock)
         {
-            if (epoch >= _currentLease.Epoch)
+            if (epoch > _currentLease.Epoch)
             {
                 _currentLease = new LeaderLease(leaderId, epoch, expiryUtc);
                 if (_currentRole == ConsensusRole.Active && leaderId != _localCoordinatorId)
                 {
                     _currentRole = ConsensusRole.Standby;
-                    DemotedToStandby?.Invoke();
+                    shouldDemote = true;
                 }
             }
+            else if (epoch == _currentLease.Epoch && leaderId == _currentLease.LeaderId)
+            {
+                // Same epoch only renews the already-recognized leader; prevents same-epoch hijacking.
+                _currentLease = new LeaderLease(leaderId, epoch, expiryUtc);
+            }
+        }
+
+        if (shouldDemote)
+        {
+            DemotedToStandby?.Invoke();
         }
     }
 
@@ -126,13 +158,16 @@ public sealed class ActiveStandbyConsensusLedger : IAsyncDisposable, IDisposable
             else if (_currentRole == ConsensusRole.Standby)
             {
                 bool shouldPromote = false;
+                LeaderLease promotedLease = default;
                 lock (_leaseLock)
                 {
-                    if (DateTimeOffset.UtcNow >= _currentLease.ExpiryUtc.Add(_options.GracePeriod))
+                    if (_currentRole == ConsensusRole.Standby &&
+                        DateTimeOffset.UtcNow >= _currentLease.ExpiryUtc.Add(_options.GracePeriod))
                     {
                         // Lease expired: assume leadership
                         ulong newEpoch = _currentLease.Epoch + 1;
-                        _currentLease = new LeaderLease(_localCoordinatorId, newEpoch, DateTimeOffset.UtcNow.Add(_options.LeaseDuration));
+                        promotedLease = new LeaderLease(_localCoordinatorId, newEpoch, DateTimeOffset.UtcNow.Add(_options.LeaseDuration));
+                        _currentLease = promotedLease;
                         _currentRole = ConsensusRole.Active;
                         shouldPromote = true;
                     }
@@ -141,6 +176,7 @@ public sealed class ActiveStandbyConsensusLedger : IAsyncDisposable, IDisposable
                 if (shouldPromote)
                 {
                     PromotedToActive?.Invoke();
+                    LeaseRenewed?.Invoke(promotedLease);
                 }
             }
         }
@@ -152,10 +188,16 @@ public sealed class ActiveStandbyConsensusLedger : IAsyncDisposable, IDisposable
         _cts.Cancel();
         if (_leaseLoopTask != null)
         {
-            try { await _leaseLoopTask.ConfigureAwait(false); } catch { }
+            try { await _leaseLoopTask.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
         }
         _cts.Dispose();
     }
 
-    public void Dispose() => DisposeAsync().AsTask().GetAwaiter().GetResult();
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _isDisposed, 1) != 0) return;
+        _cts.Cancel();
+        _cts.Dispose();
+    }
 }

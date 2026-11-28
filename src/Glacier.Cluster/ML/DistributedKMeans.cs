@@ -50,7 +50,8 @@ public sealed class DistributedKMeans
         int cols,
         RingAllReduceWorker ringWorker,
         float[]? initialCentroids = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        Guid? sessionId = null)
     {
         ArgumentNullException.ThrowIfNull(ringWorker);
         if (rows <= 0) throw new ArgumentOutOfRangeException(nameof(rows), "Rows must be positive.");
@@ -160,7 +161,7 @@ public sealed class DistributedKMeans
             }
 
             // 4. Collective AllReduce across cluster workers (aggregates sums and counts across nodes)
-            Guid stepSessionId = Guid.NewGuid();
+            Guid stepSessionId = DeriveStepSessionId(sessionId ?? s_defaultSessionNamespace, iter, k, cols, ringWorker.WorldSize);
             await ringWorker.AllReduceAsync(reductionBuffer.AsMemory(), stepSessionId, ct).ConfigureAwait(false);
 
             // 5. Global Centroid Recomputation & Convergence Check
@@ -195,11 +196,27 @@ public sealed class DistributedKMeans
     /// Fits KMeans model using a local Polaris DataFrame partition.
     /// Extracts all numeric columns into row-major contiguous memory for SIMD processing.
     /// </summary>
+    private static readonly Guid s_defaultSessionNamespace = new("7B9F4E2D-3A1C-4D8E-9C5B-1E2F3A4B5C6D");
+
+    private static Guid DeriveStepSessionId(Guid baseSession, int iter, int k, int cols, int worldSize)
+    {
+        Span<byte> bytes = stackalloc byte[32];
+        baseSession.TryWriteBytes(bytes.Slice(0, 16));
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(bytes.Slice(16, 4), iter);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(bytes.Slice(20, 4), k);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(bytes.Slice(24, 4), cols);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(bytes.Slice(28, 4), worldSize);
+        Span<byte> hash = stackalloc byte[32];
+        System.Security.Cryptography.SHA256.HashData(bytes, hash);
+        return new Guid(hash.Slice(0, 16));
+    }
+
     public async Task FitAsync(
         DataFrame localDf,
         RingAllReduceWorker ringWorker,
         float[]? initialCentroids = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        Guid? sessionId = null)
     {
         ArgumentNullException.ThrowIfNull(localDf);
         int rows = localDf.RowCount;
@@ -234,7 +251,7 @@ public sealed class DistributedKMeans
             }
         }
 
-        await FitAsync(flatData.AsMemory(), rows, cols, ringWorker, initialCentroids, ct).ConfigureAwait(false);
+        await FitAsync(flatData.AsMemory(), rows, cols, ringWorker, initialCentroids, ct, sessionId).ConfigureAwait(false);
     }
 
     /// <summary>

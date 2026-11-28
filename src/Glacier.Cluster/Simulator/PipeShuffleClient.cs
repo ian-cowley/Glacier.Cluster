@@ -64,7 +64,10 @@ internal sealed class PipeShuffleClient : IArrowShuffleClient
                 await targetNode.ShuffleServer.ProcessConnectionAsync(serverSidePipe, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) { }
-            catch (Exception) { }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[PipeShuffleClient] Server shuffle connection warning: {ex.Message}");
+            }
         }, ct);
 
         // 3. Client executes standard ArrowShuffleClient request over clientSidePipe
@@ -80,7 +83,15 @@ internal sealed class PipeShuffleClient : IArrowShuffleClient
         finally
         {
             linkedCts.Cancel();
-            try { await serverTask.ConfigureAwait(false); } catch { }
+            try
+            {
+                await serverTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[PipeShuffleClient] Server task await warning: {ex.Message}");
+            }
         }
     }
 

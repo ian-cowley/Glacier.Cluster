@@ -533,11 +533,11 @@ public sealed class ShuffleMemoryAdversarialTests
         }
 
         // Mid-read stage cleanup trigger after readers are running
-        Thread.Sleep(50);
+        await Task.Delay(50);
         store.AcknowledgeStageComplete(jobId, stageId);
 
         // Allow readers to encounter post-cleanup state
-        Thread.Sleep(50);
+        await Task.Delay(50);
         cts.Cancel();
 
         await Task.WhenAll(readerTasks);

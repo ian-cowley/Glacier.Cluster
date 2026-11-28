@@ -1,6 +1,7 @@
 namespace Glacier.Cluster.Simulator;
 
 using System;
+using System.Text.Json.Serialization;
 using Glacier.Cluster.Coordinator;
 using Glacier.Cluster.Protocol;
 
@@ -62,6 +63,7 @@ public sealed class ClusterSimulatorOptions
     public TopologyAssignmentStrategy TopologyStrategy { get; set; } = TopologyAssignmentStrategy.PhysicalFleetCyclic;
 
     /// <summary>Custom hardware profile factory when TopologyStrategy is Custom.</summary>
+    [JsonIgnore]
     public Func<int, Guid, NodeHardwareProfile>? CustomHardwareProfileFactory { get; set; }
 
     /// <summary>Worker heartbeat broadcast interval (low latency for testing).</summary>

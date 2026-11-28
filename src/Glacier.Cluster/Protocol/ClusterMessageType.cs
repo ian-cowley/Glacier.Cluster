@@ -21,6 +21,9 @@ public enum ClusterMessageType : byte
     /// <summary>0x05: Graceful leave notification prior to worker shutdown or draining.</summary>
     NodeLeave = 0x05,
 
+    /// <summary>0x06: Coordinator-to-Peer leader lease replication for active/standby consensus.</summary>
+    LeaderLease = 0x06,
+
     /// <summary>0x10: Coordinator-to-Worker stage task dispatch manifest and dependencies.</summary>
     StageDispatch = 0x10,
 
@@ -35,6 +38,9 @@ public enum ClusterMessageType : byte
 
     /// <summary>0x22: Worker-to-Worker acknowledgment releasing consumed credit tokens.</summary>
     PartitionAcknowledge = 0x22,
+
+    /// <summary>0x23: Worker-to-Worker shuffle channel authentication handshake.</summary>
+    ShuffleAuth = 0x23,
 
     /// <summary>0x30: Worker-to-Worker collective Ring AllReduce topology handshake.</summary>
     RingAllReduceHandshake = 0x30,

@@ -24,11 +24,11 @@ public sealed class PinnedBatchBufferArena : IDisposable
     private readonly int _maxTotalFloats;
     private readonly int _maxBytePayload;
 
-    private readonly byte[] _batchWireSendBuffer;
-    private readonly byte[] _batchWireRecvBuffer;
-    private readonly float[] _floatInputBuffer;
-    private readonly float[] _floatOutputBuffer;
-    private readonly float[] _logitsBuffer;
+    private byte[]? _batchWireSendBuffer;
+    private byte[]? _batchWireRecvBuffer;
+    private float[]? _floatInputBuffer;
+    private float[]? _floatOutputBuffer;
+    private float[]? _logitsBuffer;
     private bool _disposed;
 
     /// <summary>
@@ -57,18 +57,18 @@ public sealed class PinnedBatchBufferArena : IDisposable
     public int MaxTotalFloats => _maxTotalFloats;
     public int MaxBytePayload => _maxBytePayload;
 
-    public byte[] BatchWireSendArray => _batchWireSendBuffer;
-    public byte[] BatchWireRecvArray => _batchWireRecvBuffer;
-    public float[] FloatInputArray => _floatInputBuffer;
-    public float[] FloatOutputArray => _floatOutputBuffer;
-    public float[] LogitsArray => _logitsBuffer;
+    public byte[] BatchWireSendArray => _batchWireSendBuffer ?? throw new ObjectDisposedException(nameof(PinnedBatchBufferArena));
+    public byte[] BatchWireRecvArray => _batchWireRecvBuffer ?? throw new ObjectDisposedException(nameof(PinnedBatchBufferArena));
+    public float[] FloatInputArray => _floatInputBuffer ?? throw new ObjectDisposedException(nameof(PinnedBatchBufferArena));
+    public float[] FloatOutputArray => _floatOutputBuffer ?? throw new ObjectDisposedException(nameof(PinnedBatchBufferArena));
+    public float[] LogitsArray => _logitsBuffer ?? throw new ObjectDisposedException(nameof(PinnedBatchBufferArena));
 
     public Span<byte> GetBatchSendSpan(int requiredBytes)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (requiredBytes < 0 || requiredBytes > _maxBytePayload)
             throw new ArgumentOutOfRangeException(nameof(requiredBytes), $"Required bytes ({requiredBytes}) exceeds arena capacity ({_maxBytePayload}).");
-        return _batchWireSendBuffer.AsSpan(0, requiredBytes);
+        return BatchWireSendArray.AsSpan(0, requiredBytes);
     }
 
     public Span<byte> GetBatchRecvSpan(int requiredBytes)
@@ -76,7 +76,7 @@ public sealed class PinnedBatchBufferArena : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (requiredBytes < 0 || requiredBytes > _maxBytePayload)
             throw new ArgumentOutOfRangeException(nameof(requiredBytes), $"Required bytes ({requiredBytes}) exceeds arena capacity ({_maxBytePayload}).");
-        return _batchWireRecvBuffer.AsSpan(0, requiredBytes);
+        return BatchWireRecvArray.AsSpan(0, requiredBytes);
     }
 
     public Span<float> GetFloatInputSpan(int requiredCount)
@@ -84,7 +84,7 @@ public sealed class PinnedBatchBufferArena : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (requiredCount < 0 || requiredCount > _maxTotalFloats)
             throw new ArgumentOutOfRangeException(nameof(requiredCount), $"Required float count ({requiredCount}) exceeds arena capacity ({_maxTotalFloats}).");
-        return _floatInputBuffer.AsSpan(0, requiredCount);
+        return FloatInputArray.AsSpan(0, requiredCount);
     }
 
     public Span<float> GetFloatOutputSpan(int requiredCount)
@@ -92,15 +92,16 @@ public sealed class PinnedBatchBufferArena : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (requiredCount < 0 || requiredCount > _maxTotalFloats)
             throw new ArgumentOutOfRangeException(nameof(requiredCount), $"Required float count ({requiredCount}) exceeds arena capacity ({_maxTotalFloats}).");
-        return _floatOutputBuffer.AsSpan(0, requiredCount);
+        return FloatOutputArray.AsSpan(0, requiredCount);
     }
 
     public Span<float> GetLogitsSpan(int requiredCount)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (requiredCount < 0 || requiredCount > _logitsBuffer.Length)
-            throw new ArgumentOutOfRangeException(nameof(requiredCount), $"Required logits count ({requiredCount}) exceeds arena capacity ({_logitsBuffer.Length}).");
-        return _logitsBuffer.AsSpan(0, requiredCount);
+        var logits = LogitsArray;
+        if (requiredCount < 0 || requiredCount > logits.Length)
+            throw new ArgumentOutOfRangeException(nameof(requiredCount), $"Required logits count ({requiredCount}) exceeds arena capacity ({logits.Length}).");
+        return logits.AsSpan(0, requiredCount);
     }
 
     /// <summary>
@@ -109,15 +110,23 @@ public sealed class PinnedBatchBufferArena : IDisposable
     public void Reset()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        Array.Clear(_batchWireSendBuffer);
-        Array.Clear(_batchWireRecvBuffer);
-        Array.Clear(_floatInputBuffer);
-        Array.Clear(_floatOutputBuffer);
-        Array.Clear(_logitsBuffer);
+        Array.Clear(BatchWireSendArray);
+        Array.Clear(BatchWireRecvArray);
+        Array.Clear(FloatInputArray);
+        Array.Clear(FloatOutputArray);
+        Array.Clear(LogitsArray);
     }
 
     public void Dispose()
     {
-        _disposed = true;
+        if (!_disposed)
+        {
+            _disposed = true;
+            _batchWireSendBuffer = null;
+            _batchWireRecvBuffer = null;
+            _floatInputBuffer = null;
+            _floatOutputBuffer = null;
+            _logitsBuffer = null;
+        }
     }
 }

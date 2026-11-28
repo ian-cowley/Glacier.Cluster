@@ -3,6 +3,7 @@ namespace Glacier.Cluster.Shuffle;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -101,6 +102,41 @@ public sealed class PartitionEntry
             _spillFilePath = null;
             LastAccessedAtUtc = DateTime.UtcNow;
             return true;
+        }
+    }
+
+    /// <summary>
+    /// Atomically claims either the active in-memory buffer or the spilled file path for eviction.
+    /// Guarantees single cleanup even under concurrent eviction calls.
+    /// </summary>
+    public bool TryConsumeForEviction(
+        out RefCountedPartitionBuffer? buffer,
+        out string? spillFilePath,
+        out int byteLength)
+    {
+        lock (_syncLock)
+        {
+            byteLength = ByteLength;
+            if (_buffer != null)
+            {
+                buffer = _buffer;
+                spillFilePath = null;
+                _buffer = null;
+                _spillFilePath = null;
+                return true;
+            }
+
+            if (State == PartitionStorageState.SpilledToDisk && _spillFilePath != null)
+            {
+                buffer = null;
+                spillFilePath = _spillFilePath;
+                _spillFilePath = null;
+                return true;
+            }
+
+            buffer = null;
+            spillFilePath = null;
+            return false;
         }
     }
 
@@ -213,6 +249,23 @@ public sealed class LocalPartitionStore : IDisposable
             if (entry.TryTransitionToInMemory(reloaded))
             {
                 Interlocked.Add(ref _totalInMemoryBytes, reloaded.ByteLength);
+                Interlocked.Add(ref _totalSpilledBytes, -entry.ByteLength);
+                try
+                {
+                    if (File.Exists(spillPath))
+                    {
+                        File.Delete(spillPath);
+                    }
+                }
+                catch (IOException ex)
+                {
+                    Trace.TraceWarning($"[LocalPartitionStore] Best-effort spill cleanup failed for '{spillPath}': {ex.Message}");
+                }
+                catch (UnauthorizedAccessException ex)
+                {
+                    Trace.TraceWarning($"[LocalPartitionStore] Best-effort spill cleanup unauthorized for '{spillPath}': {ex.Message}");
+                }
+
                 reloaded.Retain();
                 return reloaded;
             }
@@ -319,27 +372,36 @@ public sealed class LocalPartitionStore : IDisposable
 
     private void EvictEntry(PartitionEntry entry)
     {
-        if (entry.Buffer != null)
+        if (!entry.TryConsumeForEviction(out var buf, out var spillPath, out int byteLength))
+        {
+            return;
+        }
+
+        if (buf != null)
         {
             // Release the store's hold on the buffer
-            var buf = entry.Buffer;
-            Interlocked.Add(ref _totalInMemoryBytes, -entry.ByteLength);
+            Interlocked.Add(ref _totalInMemoryBytes, -byteLength);
             buf.Release();
         }
-        else if (entry.State == PartitionStorageState.SpilledToDisk && entry.SpillFilePath != null)
+        else if (spillPath != null)
         {
             try
             {
-                if (File.Exists(entry.SpillFilePath))
+                if (File.Exists(spillPath))
                 {
-                    File.Delete(entry.SpillFilePath);
+                    File.Delete(spillPath);
                 }
             }
-            catch (Exception)
+            catch (IOException ex)
             {
-                // Best-effort cleanup
+                Trace.TraceWarning($"[LocalPartitionStore] Best-effort spill file deletion failed for '{spillPath}': {ex.Message}");
             }
-            Interlocked.Add(ref _totalSpilledBytes, -entry.ByteLength);
+            catch (UnauthorizedAccessException ex)
+            {
+                Trace.TraceWarning($"[LocalPartitionStore] Best-effort spill file deletion unauthorized for '{spillPath}': {ex.Message}");
+            }
+
+            Interlocked.Add(ref _totalSpilledBytes, -byteLength);
         }
     }
 

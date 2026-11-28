@@ -68,11 +68,12 @@ public sealed class TaskExecutor : IDisposable
                     ulong existingRowCount = 0;
                     try
                     {
-                        var df = PolarisBridge.PartitionBufferToDataFrame(existingBuffer, zeroCopy: true);
+                        using var df = PolarisBridge.PartitionBufferToDataFrame(existingBuffer, zeroCopy: true);
                         existingRowCount = (ulong)df.RowCount;
                     }
-                    catch
+                    catch (Exception ex) when (ex is not OperationCanceledException)
                     {
+                        Trace.TraceInformation($"[TaskExecutor] Non-Arrow partition buffer size fallback: {ex.Message}");
                         existingRowCount = 1;
                     }
                     finally
@@ -93,19 +94,25 @@ public sealed class TaskExecutor : IDisposable
                 if (!dispatch.OperatorPayload.IsEmpty)
                 {
                     string payloadStr = Encoding.UTF8.GetString(dispatch.OperatorPayload.Span);
-                    string[] parts = payloadStr.Split('|');
-                    string uri = parts[0];
+                    ExtractStagePayloadParts(payloadStr, out string scanAndOps, out _, out _);
+                    var parts = PredicateCompiler.SplitPipelinePayload(scanAndOps, '|');
+                    string uri = parts.Count > 0 ? parts[0] : string.Empty;
                     var filterPredicates = parts.Skip(1).Where(p => !string.IsNullOrEmpty(p)).ToList();
 
-                    if (InMemoryDistributedExecutionContext.TryGetSourcePartition(uri, dispatch.PartitionId, out var regBuffer) && regBuffer != null)
+                    if (!string.IsNullOrEmpty(uri) &&
+                        InMemoryDistributedExecutionContext.TryGetSourcePartition(uri, dispatch.PartitionId, out var regBuffer) &&
+                        regBuffer != null)
                     {
                         if (filterPredicates.Count > 0)
                         {
+                            DataFrame? inDf = null;
+                            DataFrame? outDf = null;
+                            var fusedTransientDfs = new List<DataFrame>();
                             try
                             {
-                                var inDf = PolarisBridge.PartitionBufferToDataFrame(regBuffer, zeroCopy: false);
-                                inDf = ApplyFusedOperators(inDf, filterPredicates);
-                                var filteredBuf = PolarisBridge.DataFrameToPartitionBuffer(inDf);
+                                inDf = PolarisBridge.PartitionBufferToDataFrame(regBuffer, zeroCopy: true);
+                                outDf = ApplyFusedOperators(inDf, filterPredicates, fusedTransientDfs);
+                                var filteredBuf = PolarisBridge.DataFrameToPartitionBuffer(outDf);
                                 regBuffer.Release();
                                 regBuffer = filteredBuf;
                             }
@@ -114,17 +121,33 @@ public sealed class TaskExecutor : IDisposable
                                 regBuffer.Release();
                                 throw;
                             }
+                            finally
+                            {
+                                foreach (var d in fusedTransientDfs)
+                                {
+                                    if (!ReferenceEquals(d, inDf) && !ReferenceEquals(d, outDf))
+                                    {
+                                        d.Dispose();
+                                    }
+                                }
+                                if (outDf != null && !ReferenceEquals(outDf, inDf))
+                                {
+                                    outDf.Dispose();
+                                }
+                                inDf?.Dispose();
+                            }
                         }
 
                         _partitionStore.RegisterPartition(outputKey, regBuffer);
                         ulong regRowCount = 0;
                         try
                         {
-                            var df = PolarisBridge.PartitionBufferToDataFrame(regBuffer, zeroCopy: true);
+                            using var df = PolarisBridge.PartitionBufferToDataFrame(regBuffer, zeroCopy: true);
                             regRowCount = (ulong)df.RowCount;
                         }
-                        catch
+                        catch (Exception ex) when (ex is not OperationCanceledException)
                         {
+                            Trace.TraceInformation($"[TaskExecutor] Non-Arrow registered partition size fallback: {ex.Message}");
                             regRowCount = 1;
                         }
                         finally
@@ -244,125 +267,130 @@ public sealed class TaskExecutor : IDisposable
         // 1. If upstream partitions exist, deserialize and process with Polaris
         if (upstreams.Length > 0)
         {
-            DataFrame resultDf;
+            var transientDfs = new List<DataFrame>();
+            DataFrame? resultDf = null;
 
-            switch (operatorType)
+            try
             {
-                case StageOperatorType.Filter:
+                switch (operatorType)
                 {
-                    if (upstreams[0].ByteLength == 0) throw new InvalidOperationException("Upstream partition buffer is empty.");
-                    var inputDf = PolarisBridge.PartitionBufferToDataFrame(upstreams[0], zeroCopy: false);
-                    resultDf = ExecuteFilter(inputDf, payload);
-                    break;
-                }
-
-                case StageOperatorType.Project:
-                {
-                    if (upstreams[0].ByteLength == 0) throw new InvalidOperationException("Upstream partition buffer is empty.");
-                    var inputDf = PolarisBridge.PartitionBufferToDataFrame(upstreams[0], zeroCopy: false);
-                    resultDf = ExecuteProject(inputDf, payload);
-                    break;
-                }
-
-                case StageOperatorType.GroupByMap:
-                {
-                    if (upstreams[0].ByteLength == 0) throw new InvalidOperationException("Upstream partition buffer is empty.");
-                    var inputDf = PolarisBridge.PartitionBufferToDataFrame(upstreams[0], zeroCopy: false);
-                    resultDf = inputDf;
-                    break;
-                }
-
-                case StageOperatorType.GroupByReduce:
-                {
-                    if (partitionId > 0)
+                    case StageOperatorType.Filter:
                     {
-                        var firstBuffer = upstreams.FirstOrDefault(b => b != null && b.ByteLength > 0);
-                        if (firstBuffer != null)
+                        if (upstreams[0].ByteLength == 0) throw new InvalidOperationException("Upstream partition buffer is empty.");
+                        var inputDf = PolarisBridge.PartitionBufferToDataFrame(upstreams[0], zeroCopy: true);
+                        transientDfs.Add(inputDf);
+                        resultDf = ExecuteFilter(inputDf, payload, transientDfs);
+                        break;
+                    }
+
+                    case StageOperatorType.Project:
+                    {
+                        if (upstreams[0].ByteLength == 0) throw new InvalidOperationException("Upstream partition buffer is empty.");
+                        var inputDf = PolarisBridge.PartitionBufferToDataFrame(upstreams[0], zeroCopy: true);
+                        transientDfs.Add(inputDf);
+                        resultDf = ExecuteProject(inputDf, payload);
+                        break;
+                    }
+
+                    case StageOperatorType.GroupByMap:
+                    {
+                        if (upstreams[0].ByteLength == 0) throw new InvalidOperationException("Upstream partition buffer is empty.");
+                        var inputDf = PolarisBridge.PartitionBufferToDataFrame(upstreams[0], zeroCopy: true);
+                        transientDfs.Add(inputDf);
+                        resultDf = inputDf;
+                        break;
+                    }
+
+                    case StageOperatorType.GroupByReduce:
+                    {
+                        resultDf = ExecuteGroupByReducePartitioned(partitionId, upstreams, payload, transientDfs);
+                        break;
+                    }
+
+                    case StageOperatorType.HashJoinProbe:
+                    {
+                        resultDf = ExecuteHashJoin(partitionId, upstreams, upstreamLocations, payload, transientDfs);
+                        break;
+                    }
+
+                    case StageOperatorType.Custom:
+                    {
+                        string customPayload = Encoding.UTF8.GetString(payload.Span);
+                        if (customPayload.StartsWith("REPARTITION:", StringComparison.Ordinal))
                         {
-                            var sampleDf = PolarisBridge.PartitionBufferToDataFrame(firstBuffer, zeroCopy: false);
-                            resultDf = new DataFrame(sampleDf.Columns.Select(c => c.CloneEmpty(0)).ToList());
+                            string[] parts = customPayload.Split(':', 3);
+                            int targetPartitions = int.TryParse(parts[1], out int tp) && tp > 0 ? tp : 1;
+                            string[] keys = parts.Length > 2 && !string.IsNullOrWhiteSpace(parts[2])
+                                ? parts[2].Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+                                : Array.Empty<string>();
+
+                            var bucketDfs = new List<DataFrame>(upstreams.Length);
+                            DataFrame? schemaTemplate = null;
+                            foreach (var b in upstreams)
+                            {
+                                if (b != null && b.ByteLength > 0)
+                                {
+                                    var partDf = PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: true);
+                                    transientDfs.Add(partDf);
+                                    schemaTemplate ??= partDf;
+                                    var sliced = SliceByHashBucket(partDf, partitionId, targetPartitions, keys);
+                                    if (sliced.RowCount > 0)
+                                    {
+                                        bucketDfs.Add(sliced);
+                                        if (!ReferenceEquals(sliced, partDf)) transientDfs.Add(sliced);
+                                    }
+                                    else if (!ReferenceEquals(sliced, partDf))
+                                    {
+                                        sliced.Dispose();
+                                    }
+                                }
+                            }
+
+                            resultDf = bucketDfs.Count == 1
+                                ? bucketDfs[0]
+                                : (bucketDfs.Count > 1
+                                    ? DataFrame.Concat(bucketDfs)
+                                    : (schemaTemplate != null && schemaTemplate.Columns.Count > 0
+                                        ? new DataFrame(schemaTemplate.Columns.Select(c => c.CloneEmpty(0)).ToList())
+                                        : new DataFrame()));
                         }
                         else
                         {
-                            resultDf = new DataFrame();
+                            resultDf = upstreams[0].ByteLength > 0
+                                ? PolarisBridge.PartitionBufferToDataFrame(upstreams[0], zeroCopy: true)
+                                : new DataFrame();
                         }
+                        break;
                     }
-                    else
-                    {
-                        var dfs = new List<DataFrame>(upstreams.Length);
-                        foreach (var b in upstreams)
-                        {
-                            if (b != null && b.ByteLength > 0)
-                            {
-                                dfs.Add(PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: false));
-                            }
-                        }
-                        var combinedDf = dfs.Count == 1 ? dfs[0] : (dfs.Count > 1 ? DataFrame.Concat(dfs) : new DataFrame());
-                        resultDf = ExecuteGroupByReduce(combinedDf, payload, dfs);
-                    }
-                    break;
-                }
 
-                case StageOperatorType.HashJoinProbe:
-                {
-                    resultDf = ExecuteHashJoin(partitionId, upstreams, upstreamLocations, payload);
-                    break;
-                }
-
-                case StageOperatorType.Custom:
-                {
-                    string customPayload = Encoding.UTF8.GetString(payload.Span);
-                    if (customPayload.StartsWith("REPARTITION:", StringComparison.Ordinal))
-                    {
-                        string[] parts = customPayload.Split(':', 3);
-                        int targetPartitions = int.TryParse(parts[1], out int tp) && tp > 0 ? tp : 1;
-                        string[] keys = parts.Length > 2 && !string.IsNullOrWhiteSpace(parts[2])
-                            ? parts[2].Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
-                            : Array.Empty<string>();
-
-                        var dfs = new List<DataFrame>(upstreams.Length);
-                        foreach (var b in upstreams)
-                        {
-                            if (b != null && b.ByteLength > 0)
-                            {
-                                dfs.Add(PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: false));
-                            }
-                        }
-
-                        var combinedDf = dfs.Count == 1
-                            ? dfs[0]
-                            : (dfs.Count > 1
-                                ? (dfs.All(d => d.RowCount == 0) ? (dfs.FirstOrDefault(d => d.Columns.Count > 0) ?? new DataFrame()) : DataFrame.Concat(dfs))
-                                : new DataFrame());
-
-                        var buckets = InMemoryDistributedExecutionContext.RepartitionDataFrame(combinedDf, targetPartitions, keys);
-                        resultDf = partitionId >= 0 && partitionId < buckets.Count
-                            ? buckets[partitionId]
-                            : (combinedDf.Columns.Count > 0 ? new DataFrame(combinedDf.Columns.Select(c => c.CloneEmpty(0)).ToList()) : new DataFrame());
-                    }
-                    else
+                    default:
                     {
                         resultDf = upstreams[0].ByteLength > 0
-                            ? PolarisBridge.PartitionBufferToDataFrame(upstreams[0], zeroCopy: false)
+                            ? PolarisBridge.PartitionBufferToDataFrame(upstreams[0], zeroCopy: true)
                             : new DataFrame();
+                        break;
                     }
-                    break;
                 }
 
-                default:
-                {
-                    resultDf = upstreams[0].ByteLength > 0
-                        ? PolarisBridge.PartitionBufferToDataFrame(upstreams[0], zeroCopy: false)
-                        : new DataFrame();
-                    break;
-                }
+                var outBuffer = PolarisBridge.DataFrameToPartitionBuffer(resultDf);
+                return ValueTask.FromResult((outBuffer, (ulong)resultDf.RowCount));
             }
-
-            var outBuffer = PolarisBridge.DataFrameToPartitionBuffer(resultDf);
-            return ValueTask.FromResult((outBuffer, (ulong)resultDf.RowCount));
+            finally
+            {
+                foreach (var d in transientDfs)
+                {
+                    if (!ReferenceEquals(d, resultDf))
+                    {
+                        d.Dispose();
+                    }
+                }
+                resultDf?.Dispose();
+            }
         }
 
-        if (operatorType != StageOperatorType.Scan)
+        if (operatorType != StageOperatorType.Scan &&
+            !(operatorType == StageOperatorType.GroupByMap && !payload.IsEmpty &&
+              Encoding.UTF8.GetString(payload.Span).Contains("\u001fGROUPBY:", StringComparison.Ordinal)))
         {
             throw new InvalidOperationException($"Stage operator '{operatorType}' requires upstream input partitions to execute.");
         }
@@ -381,8 +409,9 @@ public sealed class TaskExecutor : IDisposable
         }
 
         string payloadStr = Encoding.UTF8.GetString(payload.Span);
-        string[] parts = payloadStr.Split('|');
-        string rawUri = parts[0].Trim();
+        ExtractStagePayloadParts(payloadStr, out string scanAndOps, out _, out int totalPartitions);
+        var parts = PredicateCompiler.SplitPipelinePayload(scanAndOps, '|');
+        string rawUri = parts.Count > 0 ? parts[0].Trim() : string.Empty;
         var filterPredicates = parts.Skip(1).Where(p => !string.IsNullOrEmpty(p)).ToList();
 
         string localPath = rawUri;
@@ -400,78 +429,169 @@ public sealed class TaskExecutor : IDisposable
                 localPath);
         }
 
-        DataFrame scannedDf;
-        string ext = System.IO.Path.GetExtension(localPath);
-        if (ext.Equals(".parquet", StringComparison.OrdinalIgnoreCase))
+        var transientDfs = new List<DataFrame>();
+        DataFrame? scannedDf = null;
+        try
         {
-            var reader = new Glacier.Polaris.IO.ParquetReader(localPath);
-            var rowGroups = new List<DataFrame>();
-            await foreach (var rg in reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            string ext = System.IO.Path.GetExtension(localPath);
+            bool rowGroupsAlreadyDistributed = false;
+            if (ext.Equals(".parquet", StringComparison.OrdinalIgnoreCase))
             {
-                rowGroups.Add(rg);
+                var reader = new Glacier.Polaris.IO.ParquetReader(localPath);
+                var ownedRowGroups = new List<DataFrame>();
+                DataFrame? schemaDf = null;
+                int rgIdx = 0;
+                await foreach (var rg in reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    transientDfs.Add(rg);
+                    schemaDf ??= rg;
+                    if (totalPartitions > 1)
+                    {
+                        if ((rgIdx % totalPartitions) == partitionId)
+                        {
+                            ownedRowGroups.Add(rg);
+                        }
+                    }
+                    else
+                    {
+                        ownedRowGroups.Add(rg);
+                    }
+                    rgIdx++;
+                }
+
+                if (totalPartitions > 1 && rgIdx == 1 && schemaDf != null)
+                {
+                    // Single-row-group Parquet fallback: slice rows evenly across workers
+                    scannedDf = SliceRowsByRange(schemaDf, partitionId, totalPartitions);
+                    rowGroupsAlreadyDistributed = true;
+                }
+                else if (totalPartitions > 1)
+                {
+                    rowGroupsAlreadyDistributed = true;
+                    scannedDf = ownedRowGroups.Count == 0
+                        ? (schemaDf != null && schemaDf.Columns.Count > 0
+                            ? new DataFrame(schemaDf.Columns.Select(c => c.CloneEmpty(0)).ToList())
+                            : new DataFrame())
+                        : (ownedRowGroups.Count == 1 ? ownedRowGroups[0] : DataFrame.Concat(ownedRowGroups));
+                }
+                else
+                {
+                    scannedDf = ownedRowGroups.Count == 0
+                        ? new DataFrame()
+                        : (ownedRowGroups.Count == 1 ? ownedRowGroups[0] : DataFrame.Concat(ownedRowGroups));
+                }
             }
-            scannedDf = rowGroups.Count == 0
-                ? new DataFrame()
-                : (rowGroups.Count == 1 ? rowGroups[0] : DataFrame.Concat(rowGroups));
-        }
-        else if (ext.Equals(".csv", StringComparison.OrdinalIgnoreCase))
-        {
-            scannedDf = await DataFrame.ScanCsv(localPath).Collect().ConfigureAwait(false);
-        }
-        else if (ext.Equals(".json", StringComparison.OrdinalIgnoreCase) || ext.Equals(".ndjson", StringComparison.OrdinalIgnoreCase))
-        {
-            scannedDf = DataFrame.ReadJson(localPath);
-        }
-        else
-        {
-            byte[] rawBytes = await System.IO.File.ReadAllBytesAsync(localPath, cancellationToken).ConfigureAwait(false);
-            using var tempBuf = RefCountedPartitionBuffer.Allocate(rawBytes.Length);
-            rawBytes.CopyTo(tempBuf.Span);
-            scannedDf = PolarisBridge.PartitionBufferToDataFrame(tempBuf, zeroCopy: false);
-        }
-
-        if (partitionId > 0 && scannedDf.Columns.Count > 0)
-        {
-            scannedDf = new DataFrame(scannedDf.Columns.Select(c => c.CloneEmpty(0)).ToList());
-        }
-
-        scannedDf = ApplyFusedOperators(scannedDf, filterPredicates);
-
-        var outBuffer = PolarisBridge.DataFrameToPartitionBuffer(scannedDf);
-        return (outBuffer, (ulong)scannedDf.RowCount);
-    }
-
-    internal static DataFrame ApplyFusedOperators(DataFrame df, IEnumerable<string> operations)
-    {
-        foreach (var op in operations)
-        {
-            if (string.IsNullOrWhiteSpace(op)) continue;
-
-            if (op.StartsWith("PROJECT:", StringComparison.Ordinal))
+            else if (ext.Equals(".csv", StringComparison.OrdinalIgnoreCase))
             {
-                string[] cols = op["PROJECT:".Length..].Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-                df = df.Select(cols);
+                scannedDf = await DataFrame.ScanCsv(localPath).Collect().ConfigureAwait(false);
+            }
+            else if (ext.Equals(".json", StringComparison.OrdinalIgnoreCase) || ext.Equals(".ndjson", StringComparison.OrdinalIgnoreCase))
+            {
+                scannedDf = DataFrame.ReadJson(localPath);
             }
             else
             {
-                var preCols = df.Columns;
-                var expr = PredicateCompiler.Compile(op);
-                var filtered = df.Filter(expr);
-                if (filtered.Columns.Count == 0 && preCols.Count > 0)
-                {
-                    filtered = new DataFrame(preCols.Select(c => c.CloneEmpty(0)).ToList());
-                }
-                df = filtered;
+                byte[] rawBytes = await System.IO.File.ReadAllBytesAsync(localPath, cancellationToken).ConfigureAwait(false);
+                using var tempBuf = RefCountedPartitionBuffer.Allocate(rawBytes.Length);
+                rawBytes.CopyTo(tempBuf.Span);
+                scannedDf = PolarisBridge.PartitionBufferToDataFrame(tempBuf, zeroCopy: false);
             }
+
+            if (!rowGroupsAlreadyDistributed)
+            {
+                if (totalPartitions > 1)
+                {
+                    var slicedDf = SliceRowsByRange(scannedDf, partitionId, totalPartitions);
+                    if (!ReferenceEquals(slicedDf, scannedDf)) transientDfs.Add(scannedDf);
+                    scannedDf = slicedDf;
+                }
+                else if (partitionId > 0 && scannedDf.Columns.Count > 0)
+                {
+                    var emptyDf = new DataFrame(scannedDf.Columns.Select(c => c.CloneEmpty(0)).ToList());
+                    transientDfs.Add(scannedDf);
+                    scannedDf = emptyDf;
+                }
+            }
+
+            scannedDf = ApplyFusedOperators(scannedDf, filterPredicates, transientDfs);
+
+            var outBuffer = PolarisBridge.DataFrameToPartitionBuffer(scannedDf);
+            return (outBuffer, (ulong)scannedDf.RowCount);
         }
-        return df;
+        finally
+        {
+            foreach (var d in transientDfs)
+            {
+                if (!ReferenceEquals(d, scannedDf))
+                {
+                    d.Dispose();
+                }
+            }
+            scannedDf?.Dispose();
+        }
     }
 
-    private static DataFrame ExecuteFilter(DataFrame df, ReadOnlyMemory<byte> payload)
+    internal static DataFrame ApplyFusedOperators(DataFrame df, IEnumerable<string> operations, List<DataFrame>? transientDfs = null)
+    {
+        DataFrame initialDf = df;
+        try
+        {
+            foreach (var op in operations)
+            {
+                if (string.IsNullOrWhiteSpace(op)) continue;
+
+                DataFrame nextDf;
+                if (op.StartsWith("PROJECT:", StringComparison.Ordinal))
+                {
+                    string[] cols = op["PROJECT:".Length..].Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+                    nextDf = df.Select(cols);
+                }
+                else
+                {
+                    var preCols = df.Columns;
+                    var expr = PredicateCompiler.Compile(op);
+                    var filtered = df.Filter(expr);
+                    if (filtered.Columns.Count == 0 && preCols.Count > 0)
+                    {
+                        var emptyFiltered = new DataFrame(preCols.Select(c => c.CloneEmpty(0)).ToList());
+                        filtered.Dispose();
+                        filtered = emptyFiltered;
+                    }
+                    nextDf = filtered;
+                }
+
+                if (!ReferenceEquals(nextDf, df))
+                {
+                    if (transientDfs != null)
+                    {
+                        if (!transientDfs.Contains(df)) transientDfs.Add(df);
+                        transientDfs.Add(nextDf);
+                    }
+                    else if (!ReferenceEquals(df, initialDf))
+                    {
+                        df.Dispose();
+                    }
+                    df = nextDf;
+                }
+            }
+            return df;
+        }
+        catch
+        {
+            if (transientDfs == null && !ReferenceEquals(df, initialDf))
+            {
+                df.Dispose();
+            }
+            throw;
+        }
+    }
+
+    private static DataFrame ExecuteFilter(DataFrame df, ReadOnlyMemory<byte> payload, List<DataFrame>? transientDfs = null)
     {
         if (payload.IsEmpty) return df;
         string exprStr = Encoding.UTF8.GetString(payload.Span);
-        return ApplyFusedOperators(df, exprStr.Split('|', StringSplitOptions.RemoveEmptyEntries));
+        var ops = PredicateCompiler.SplitPipelinePayload(exprStr, '|').Where(p => !string.IsNullOrEmpty(p));
+        return ApplyFusedOperators(df, ops, transientDfs);
     }
 
     private static DataFrame ExecuteProject(DataFrame df, ReadOnlyMemory<byte> payload)
@@ -482,9 +602,142 @@ public sealed class TaskExecutor : IDisposable
         return df.Select(columns);
     }
 
-    private static DataFrame ExecuteGroupByReduce(DataFrame combinedDf, ReadOnlyMemory<byte> payload, List<DataFrame> dfs)
+    private static DataFrame ExecuteGroupByReducePartitioned(
+        int partitionId,
+        RefCountedPartitionBuffer[] upstreams,
+        ReadOnlyMemory<byte> payload,
+        List<DataFrame> transientDfs)
     {
-        string payloadStr = Encoding.UTF8.GetString(payload.Span).Trim();
+        string rawPayload = Encoding.UTF8.GetString(payload.Span).Trim();
+        ExtractStagePayloadParts(rawPayload, out string payloadStr, out _, out int totalPartitions);
+        if (totalPartitions <= 1)
+        {
+            if (partitionId > 0)
+            {
+                var firstBuffer = upstreams.FirstOrDefault(b => b != null && b.ByteLength > 0);
+                if (firstBuffer != null)
+                {
+                    using var sampleDf = PolarisBridge.PartitionBufferToDataFrame(firstBuffer, zeroCopy: true);
+                    return new DataFrame(sampleDf.Columns.Select(c => c.CloneEmpty(0)).ToList());
+                }
+                return new DataFrame();
+            }
+
+            var singleDfs = new List<DataFrame>(upstreams.Length);
+            foreach (var b in upstreams)
+            {
+                if (b != null && b.ByteLength > 0)
+                {
+                    var df = PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: true);
+                    transientDfs.Add(df);
+                    singleDfs.Add(df);
+                }
+            }
+            var singleCombined = singleDfs.Count == 1 ? singleDfs[0] : (singleDfs.Count > 1 ? DataFrame.Concat(singleDfs) : new DataFrame());
+            if (singleDfs.Count > 1) transientDfs.Add(singleCombined);
+            return ExecuteGroupByReduceCore(singleCombined, payloadStr, singleDfs);
+        }
+
+        ParseGroupBySpec(payloadStr, upstreams, transientDfs, out string[] groupKeys, out _, out _);
+        var bucketDfs = new List<DataFrame>(upstreams.Length);
+        DataFrame? schemaTemplate = null;
+        foreach (var b in upstreams)
+        {
+            if (b != null && b.ByteLength > 0)
+            {
+                var df = PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: true);
+                transientDfs.Add(df);
+                schemaTemplate ??= df;
+                if (df.RowCount > 0)
+                {
+                    var sliced = SliceByHashBucket(df, partitionId, totalPartitions, groupKeys);
+                    if (sliced.RowCount > 0)
+                    {
+                        bucketDfs.Add(sliced);
+                        if (!ReferenceEquals(sliced, df)) transientDfs.Add(sliced);
+                    }
+                    else if (!ReferenceEquals(sliced, df))
+                    {
+                        sliced.Dispose();
+                    }
+                }
+            }
+        }
+
+        var combinedDf = bucketDfs.Count == 1
+            ? bucketDfs[0]
+            : (bucketDfs.Count > 1
+                ? DataFrame.Concat(bucketDfs)
+                : (schemaTemplate != null && schemaTemplate.Columns.Count > 0
+                    ? new DataFrame(schemaTemplate.Columns.Select(c => c.CloneEmpty(0)).ToList())
+                    : new DataFrame()));
+        if (bucketDfs.Count > 1 || bucketDfs.Count == 0) transientDfs.Add(combinedDf);
+
+        var templateList = bucketDfs.Count > 0
+            ? bucketDfs
+            : (schemaTemplate != null ? new List<DataFrame> { schemaTemplate } : new List<DataFrame>());
+        return ExecuteGroupByReduceCore(combinedDf, payloadStr, templateList);
+    }
+
+    private static void ParseGroupBySpec(
+        string payloadStr,
+        RefCountedPartitionBuffer[]? upstreams,
+        List<DataFrame> transientDfs,
+        out string[] groupKeys,
+        out string[] aggs,
+        out DataFrame? firstDf)
+    {
+        firstDf = null;
+        if (payloadStr.Contains(';'))
+        {
+            var parts = payloadStr.Split(';', 2, StringSplitOptions.TrimEntries);
+            groupKeys = parts[0].Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+            aggs = parts[1].Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+            return;
+        }
+        if (payloadStr.Contains('|'))
+        {
+            var parts = payloadStr.Split('|', 2, StringSplitOptions.TrimEntries);
+            groupKeys = parts[0].Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+            aggs = parts[1].Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+            return;
+        }
+
+        aggs = payloadStr.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (upstreams != null)
+        {
+            var firstBuf = upstreams.FirstOrDefault(b => b != null && b.ByteLength > 0);
+            if (firstBuf != null)
+            {
+                firstDf = PolarisBridge.PartitionBufferToDataFrame(firstBuf, zeroCopy: true);
+                transientDfs.Add(firstDf);
+            }
+        }
+
+        if (firstDf != null && firstDf.Columns.Count > 0)
+        {
+            var targetCols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rawAgg in aggs)
+            {
+                int open = rawAgg.IndexOf('(');
+                int close = rawAgg.LastIndexOf(')');
+                if (open >= 0 && close > open)
+                {
+                    string col = rawAgg.Substring(open + 1, close - open - 1).Trim();
+                    if (col != "*") targetCols.Add(col);
+                }
+            }
+            var nonAggCols = firstDf.Columns.Where(c => !targetCols.Contains(c.Name)).Select(c => c.Name).ToArray();
+            groupKeys = nonAggCols.Length > 0 ? nonAggCols : new[] { firstDf.Columns[0].Name };
+        }
+        else
+        {
+            groupKeys = Array.Empty<string>();
+        }
+    }
+
+    private static DataFrame ExecuteGroupByReduceCore(DataFrame combinedDf, string payloadStr, List<DataFrame> dfs)
+    {
         string[] groupKeys;
         string[] aggs;
 
@@ -584,15 +837,8 @@ public sealed class TaskExecutor : IDisposable
             reducedDf = combinedDf.GroupBy(groupKeys).Agg(parsedAggs.ToArray());
             foreach (var (orig, target) in renameMap)
             {
-                try
-                {
-                    var c = reducedDf.GetColumn(orig);
-                    c.Rename(target);
-                }
-                catch
-                {
-                    // Ignore if name matches or not found
-                }
+                var col = reducedDf.Columns.FirstOrDefault(c => string.Equals(c.Name, orig, StringComparison.Ordinal));
+                col?.Rename(target);
             }
         }
 
@@ -603,9 +849,25 @@ public sealed class TaskExecutor : IDisposable
         int partitionId,
         RefCountedPartitionBuffer[] upstreams,
         UpstreamPartitionLocation[] upstreamLocations,
-        ReadOnlyMemory<byte> payload)
+        ReadOnlyMemory<byte> payload,
+        List<DataFrame> transientDfs)
     {
-        string joinKey = Encoding.UTF8.GetString(payload.Span).Trim();
+        string rawPayload = Encoding.UTF8.GetString(payload.Span).Trim();
+        bool isCoPartitioned = false;
+        int totalPartitions = 0;
+        string joinKey = rawPayload;
+        int coPartIdx = rawPayload.IndexOf("\u001fCO_PART:", StringComparison.Ordinal);
+        if (coPartIdx >= 0)
+        {
+            joinKey = rawPayload[..coPartIdx].Trim();
+            isCoPartitioned = true;
+            _ = int.TryParse(rawPayload[(coPartIdx + "\u001fCO_PART:".Length)..], out totalPartitions);
+        }
+        else
+        {
+            ExtractStagePayloadParts(rawPayload, out string basePart, out _, out totalPartitions);
+            joinKey = basePart.Trim();
+        }
 
         var leftBuffers = new List<RefCountedPartitionBuffer>();
         var rightBuffers = new List<RefCountedPartitionBuffer>();
@@ -613,29 +875,52 @@ public sealed class TaskExecutor : IDisposable
         if (upstreamLocations.Length > 0)
         {
             int firstStageId = upstreamLocations[0].StageId;
-            bool matchedSpecificLeft = false;
-            for (int i = 0; i < upstreams.Length; i++)
-            {
-                if (i < upstreamLocations.Length && upstreamLocations[i].StageId == firstStageId)
-                {
-                    if (upstreamLocations[i].PartitionId == partitionId)
-                    {
-                        leftBuffers.Add(upstreams[i]);
-                        matchedSpecificLeft = true;
-                    }
-                }
-                else
-                {
-                    rightBuffers.Add(upstreams[i]);
-                }
-            }
-
-            if (!matchedSpecificLeft)
+            if (isCoPartitioned)
             {
                 for (int i = 0; i < upstreams.Length; i++)
                 {
                     if (i < upstreamLocations.Length && upstreamLocations[i].StageId == firstStageId)
                         leftBuffers.Add(upstreams[i]);
+                    else
+                        rightBuffers.Add(upstreams[i]);
+                }
+            }
+            else if (totalPartitions > 1)
+            {
+                for (int i = 0; i < upstreams.Length; i++)
+                {
+                    if (i < upstreamLocations.Length && upstreamLocations[i].StageId == firstStageId)
+                        leftBuffers.Add(upstreams[i]);
+                    else
+                        rightBuffers.Add(upstreams[i]);
+                }
+            }
+            else
+            {
+                bool matchedSpecificLeft = false;
+                for (int i = 0; i < upstreams.Length; i++)
+                {
+                    if (i < upstreamLocations.Length && upstreamLocations[i].StageId == firstStageId)
+                    {
+                        if (upstreamLocations[i].PartitionId == partitionId)
+                        {
+                            leftBuffers.Add(upstreams[i]);
+                            matchedSpecificLeft = true;
+                        }
+                    }
+                    else
+                    {
+                        rightBuffers.Add(upstreams[i]);
+                    }
+                }
+
+                if (!matchedSpecificLeft)
+                {
+                    for (int i = 0; i < upstreams.Length; i++)
+                    {
+                        if (i < upstreamLocations.Length && upstreamLocations[i].StageId == firstStageId)
+                            leftBuffers.Add(upstreams[i]);
+                    }
                 }
             }
         }
@@ -649,13 +934,185 @@ public sealed class TaskExecutor : IDisposable
             }
         }
 
-        var leftDfs = leftBuffers.Where(b => b != null && b.ByteLength > 0).Select(b => PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: false)).ToList();
-        var rightDfs = rightBuffers.Where(b => b != null && b.ByteLength > 0).Select(b => PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: false)).ToList();
+        string[] joinKeys = string.IsNullOrEmpty(joinKey) ? Array.Empty<string>() : new[] { joinKey };
+        bool filterBuckets = !isCoPartitioned && totalPartitions > 1 && joinKeys.Length > 0;
 
-        var leftDf = leftDfs.Count == 1 ? leftDfs[0] : (leftDfs.Count > 1 ? DataFrame.Concat(leftDfs) : new DataFrame());
-        var rightDf = rightDfs.Count == 1 ? rightDfs[0] : (rightDfs.Count > 1 ? DataFrame.Concat(rightDfs) : new DataFrame());
+        var leftDfs = new List<DataFrame>(leftBuffers.Count);
+        DataFrame? leftTemplate = null;
+        foreach (var b in leftBuffers)
+        {
+            if (b != null && b.ByteLength > 0)
+            {
+                var df = PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: true);
+                transientDfs.Add(df);
+                leftTemplate ??= df;
+                if (filterBuckets)
+                {
+                    var sliced = SliceByHashBucket(df, partitionId, totalPartitions, joinKeys);
+                    if (sliced.RowCount > 0)
+                    {
+                        leftDfs.Add(sliced);
+                        if (!ReferenceEquals(sliced, df)) transientDfs.Add(sliced);
+                    }
+                    else if (!ReferenceEquals(sliced, df))
+                    {
+                        sliced.Dispose();
+                    }
+                }
+                else
+                {
+                    leftDfs.Add(df);
+                }
+            }
+        }
+
+        var rightDfs = new List<DataFrame>(rightBuffers.Count);
+        DataFrame? rightTemplate = null;
+        foreach (var b in rightBuffers)
+        {
+            if (b != null && b.ByteLength > 0)
+            {
+                var df = PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: true);
+                transientDfs.Add(df);
+                rightTemplate ??= df;
+                if (filterBuckets)
+                {
+                    var sliced = SliceByHashBucket(df, partitionId, totalPartitions, joinKeys);
+                    if (sliced.RowCount > 0)
+                    {
+                        rightDfs.Add(sliced);
+                        if (!ReferenceEquals(sliced, df)) transientDfs.Add(sliced);
+                    }
+                    else if (!ReferenceEquals(sliced, df))
+                    {
+                        sliced.Dispose();
+                    }
+                }
+                else
+                {
+                    rightDfs.Add(df);
+                }
+            }
+        }
+
+        var leftDf = leftDfs.Count == 1
+            ? leftDfs[0]
+            : (leftDfs.Count > 1
+                ? DataFrame.Concat(leftDfs)
+                : (leftTemplate != null && leftTemplate.Columns.Count > 0
+                    ? new DataFrame(leftTemplate.Columns.Select(c => c.CloneEmpty(0)).ToList())
+                    : new DataFrame()));
+        if (leftDfs.Count != 1) transientDfs.Add(leftDf);
+
+        var rightDf = rightDfs.Count == 1
+            ? rightDfs[0]
+            : (rightDfs.Count > 1
+                ? DataFrame.Concat(rightDfs)
+                : (rightTemplate != null && rightTemplate.Columns.Count > 0
+                    ? new DataFrame(rightTemplate.Columns.Select(c => c.CloneEmpty(0)).ToList())
+                    : new DataFrame()));
+        if (rightDfs.Count != 1) transientDfs.Add(rightDf);
 
         return leftDf.Join(rightDf, joinKey, JoinType.Inner);
+    }
+
+    private static void ExtractStagePayloadParts(
+        string payload,
+        out string scanAndOps,
+        out string groupKeys,
+        out int totalPartitions)
+    {
+        totalPartitions = 0;
+        string working = payload;
+        int pIdx = working.IndexOf("\u001fP:", StringComparison.Ordinal);
+        if (pIdx >= 0)
+        {
+            _ = int.TryParse(working[(pIdx + "\u001fP:".Length)..], out totalPartitions);
+            working = working[..pIdx];
+        }
+
+        int gbIdx = working.IndexOf("\u001fGROUPBY:", StringComparison.Ordinal);
+        if (gbIdx >= 0)
+        {
+            scanAndOps = working[..gbIdx];
+            groupKeys = working[(gbIdx + "\u001fGROUPBY:".Length)..];
+        }
+        else
+        {
+            scanAndOps = working;
+            groupKeys = string.Empty;
+        }
+    }
+
+    private static DataFrame SliceRowsByRange(DataFrame df, int partitionId, int totalPartitions)
+    {
+        if (df.Columns.Count == 0 || df.RowCount == 0)
+            return df;
+
+        int totalRows = df.RowCount;
+        int start = (int)((long)partitionId * totalRows / totalPartitions);
+        int end = (int)((long)(partitionId + 1) * totalRows / totalPartitions);
+        int length = Math.Max(0, end - start);
+        if (length == 0)
+        {
+            return new DataFrame(df.Columns.Select(c => c.CloneEmpty(0)).ToList());
+        }
+
+        return df.Slice(start, length);
+    }
+
+    private static DataFrame SliceByHashBucket(
+        DataFrame df,
+        int targetBucket,
+        int totalPartitions,
+        string[] keys)
+    {
+        if (df.Columns.Count == 0 || df.RowCount == 0 || totalPartitions <= 1)
+            return df;
+
+        var indices = new List<int>((df.RowCount / totalPartitions) + 1);
+        if (keys.Length > 0 && keys.All(k => df.Columns.Any(c => string.Equals(c.Name, k, StringComparison.Ordinal))))
+        {
+            var keyCols = keys.Select(df.GetColumn).ToArray();
+            for (int row = 0; row < df.RowCount; row++)
+            {
+                var hc = new HashCode();
+                for (int k = 0; k < keyCols.Length; k++)
+                {
+                    hc.Add(keyCols[k].Get(row));
+                }
+                int bucket = (int)((uint)hc.ToHashCode() % (uint)totalPartitions);
+                if (bucket == targetBucket)
+                {
+                    indices.Add(row);
+                }
+            }
+        }
+        else
+        {
+            for (int row = 0; row < df.RowCount; row++)
+            {
+                if ((row % totalPartitions) == targetBucket)
+                {
+                    indices.Add(row);
+                }
+            }
+        }
+
+        if (indices.Count == 0)
+        {
+            return new DataFrame(df.Columns.Select(c => c.CloneEmpty(0)).ToList());
+        }
+
+        var span = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(indices);
+        var subCols = new List<ISeries>(df.Columns.Count);
+        foreach (var col in df.Columns)
+        {
+            var subCol = Glacier.Polaris.Compute.UniqueKernels.CreateSeriesForTake(col, span);
+            col.Take(subCol, span);
+            subCols.Add(subCol);
+        }
+        return new DataFrame(subCols);
     }
 
     private static DataFrame CreateEmptyGroupByDataFrame(

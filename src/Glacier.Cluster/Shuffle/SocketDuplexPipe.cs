@@ -33,13 +33,17 @@ public sealed class SocketDuplexPipe : IDuplexPipe, IAsyncDisposable, IDisposabl
 
         try
         {
-            await Input.CompleteAsync().ConfigureAwait(false);
             await Output.CompleteAsync().ConfigureAwait(false);
+            if (_socket.Connected)
+            {
+                _socket.Shutdown(SocketShutdown.Send);
+            }
+            await Input.CompleteAsync().ConfigureAwait(false);
             await _stream.DisposeAsync().ConfigureAwait(false);
         }
-        catch
+        catch (Exception ex)
         {
-            // Best-effort cleanup
+            System.Diagnostics.Trace.TraceInformation($"[SocketDuplexPipe] Async pipe cleanup notice: {ex.Message}");
         }
         finally
         {
@@ -58,9 +62,9 @@ public sealed class SocketDuplexPipe : IDuplexPipe, IAsyncDisposable, IDisposabl
             Output.Complete();
             _stream.Dispose();
         }
-        catch
+        catch (Exception ex)
         {
-            // Best-effort cleanup
+            System.Diagnostics.Trace.TraceInformation($"[SocketDuplexPipe] Sync pipe cleanup notice: {ex.Message}");
         }
         finally
         {

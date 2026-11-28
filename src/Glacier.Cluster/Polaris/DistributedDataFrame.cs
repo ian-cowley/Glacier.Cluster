@@ -246,11 +246,37 @@ public sealed class DistributedDataFrame : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Writes the distributed dataframe as a genuine Apache Parquet file via Glacier.Polaris.
+    /// Writes the distributed dataframe as a genuine Apache Parquet file (or partitioned shard directory) via Glacier.Polaris.
     /// </summary>
     public async ValueTask WriteParquetAsync(string clusterPath, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(clusterPath);
+
+        if (IsDirectoryShardTarget(clusterPath))
+        {
+            Directory.CreateDirectory(clusterPath);
+            var buffers = await CollectBuffersAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                for (int p = 0; p < buffers.Count; p++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    using var partDf = PolarisBridge.PartitionBufferToDataFrame(buffers[p], zeroCopy: true);
+                    if (partDf.RowCount == 0 || partDf.Columns.Count == 0)
+                    {
+                        continue;
+                    }
+                    string shardPath = Path.Combine(clusterPath, $"part-{p:D5}.parquet");
+                    partDf.WriteParquet(shardPath);
+                }
+            }
+            finally
+            {
+                foreach (var b in buffers) b.Release();
+            }
+            return;
+        }
+
         var df = await CollectAsync(cancellationToken).ConfigureAwait(false);
         string? directory = Path.GetDirectoryName(clusterPath);
         if (!string.IsNullOrEmpty(directory))
@@ -261,11 +287,34 @@ public sealed class DistributedDataFrame : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Writes the distributed dataframe as an Arrow IPC stream file.
+    /// Writes the distributed dataframe as an Arrow IPC stream file (or partitioned shard directory).
     /// </summary>
     public async ValueTask WriteArrowIpcAsync(string clusterPath, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(clusterPath);
+
+        if (IsDirectoryShardTarget(clusterPath))
+        {
+            Directory.CreateDirectory(clusterPath);
+            var buffers = await CollectBuffersAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                for (int p = 0; p < buffers.Count; p++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    using var partDf = PolarisBridge.PartitionBufferToDataFrame(buffers[p], zeroCopy: true);
+                    string shardPath = Path.Combine(clusterPath, $"part-{p:D5}.arrow");
+                    using var shardFs = File.Create(shardPath);
+                    partDf.ToArrowIpc(shardFs, leaveOpen: false);
+                }
+            }
+            finally
+            {
+                foreach (var b in buffers) b.Release();
+            }
+            return;
+        }
+
         var df = await CollectAsync(cancellationToken).ConfigureAwait(false);
         string? directory = Path.GetDirectoryName(clusterPath);
         if (!string.IsNullOrEmpty(directory))
@@ -274,6 +323,51 @@ public sealed class DistributedDataFrame : IAsyncDisposable, IDisposable
         }
         using var fs = File.Create(clusterPath);
         df.ToArrowIpc(fs, leaveOpen: false);
+    }
+
+    private static bool IsDirectoryShardTarget(string path)
+    {
+        return path.EndsWith(Path.DirectorySeparatorChar) ||
+               path.EndsWith(Path.AltDirectorySeparatorChar) ||
+               Directory.Exists(path) ||
+               string.IsNullOrEmpty(Path.GetExtension(path));
+    }
+
+    private async ValueTask<IReadOnlyList<RefCountedPartitionBuffer>> CollectBuffersAsync(CancellationToken cancellationToken)
+    {
+        if (ExecutionContext is InMemoryDistributedExecutionContext)
+        {
+            var stageCompiler = new StageCompiler();
+            var dag = stageCompiler.Compile(JobId, $"{Name}_Write", LogicalPlan, PartitionCount);
+            return await ExecutionContext.ExecuteDagAsync(dag, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (LogicalPlan is LogicalProjectNode proj &&
+            ExecutionContext.GetType().Name.Contains("ClusterSimulator", StringComparison.Ordinal))
+        {
+            var compiler = new StageCompiler();
+            var strippedPlan = proj.Source;
+            var dag = compiler.Compile(JobId, $"{Name}_Write_Select", strippedPlan, PartitionCount);
+            var bufs = await ExecutionContext.ExecuteDagAsync(dag, cancellationToken).ConfigureAwait(false);
+            var projected = new List<RefCountedPartitionBuffer>(bufs.Count);
+            try
+            {
+                foreach (var b in bufs)
+                {
+                    var partDf = PolarisBridge.PartitionBufferToDataFrame(b, zeroCopy: true);
+                    projected.Add(PolarisBridge.DataFrameToPartitionBuffer(partDf.Select(proj.Columns)));
+                }
+                return projected;
+            }
+            finally
+            {
+                foreach (var b in bufs) b.Release();
+            }
+        }
+
+        var defaultCompiler = new StageCompiler();
+        var defaultDag = defaultCompiler.Compile(JobId, $"{Name}_Write", LogicalPlan, PartitionCount);
+        return await ExecutionContext.ExecuteDagAsync(defaultDag, cancellationToken).ConfigureAwait(false);
     }
 
     public void Dispose()

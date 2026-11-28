@@ -64,8 +64,8 @@ public sealed class ClusterSimulatorExecutionContext : IDistributedExecutionCont
             if (dag.JobName.Contains("_Select") && !string.IsNullOrEmpty(_datasetName) && _datasetName.Contains(','))
             {
                 string[] cols = _datasetName.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-                var df = PolarisBridge.PartitionBufferToDataFrame(buffer, zeroCopy: false);
-                var projDf = df.Select(cols);
+                using var df = PolarisBridge.PartitionBufferToDataFrame(buffer, zeroCopy: true);
+                using var projDf = df.Select(cols);
                 var projBuffer = PolarisBridge.DataFrameToPartitionBuffer(projDf);
                 buffer.Release();
                 buffer = projBuffer;

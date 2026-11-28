@@ -115,7 +115,6 @@ public sealed unsafe class VulkanClusterStageModel : IClusterStageModel
         _backendName = backendName ?? $"Vulkan GPU [Device {_ctx.DeviceOrdinal}] ({_ctx.DeviceName})";
 
         _kvCache = new KVCache(_layerCount, _headCountKv, _headDim, _maxSeqLen);
-        InitializeVulkanPipelinesAndBuffers();
     }
 
     public VulkanClusterStageModel(
@@ -142,6 +141,10 @@ public sealed unsafe class VulkanClusterStageModel : IClusterStageModel
         _backendName = $"Vulkan GPU [Device {_ctx.DeviceOrdinal}] ({_ctx.DeviceName})";
 
         _kvCache = new KVCache(_layerCount, _headCountKv, _headDim, _maxSeqLen);
+    }
+
+    private void EnsurePipelinesInitialized()
+    {
         InitializeVulkanPipelinesAndBuffers();
     }
 

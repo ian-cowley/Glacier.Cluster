@@ -1,0 +1,22 @@
+<Project>
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Packages.props', '$(MSBuildThisFileDirectory)../'))"
+          Condition="Exists($([MSBuild]::GetPathOfFileAbove('Directory.Packages.props', '$(MSBuildThisFileDirectory)../')))" />
+
+  <PropertyGroup Condition="'$(_RootPackagesPropsLoaded)' != 'true'">
+    <_GlacierRelProjDir>\$([MSBuild]::MakeRelative('$(MSBuildThisFileDirectory)', '$(MSBuildProjectDirectory)'))\</_GlacierRelProjDir>
+    <ManagePackageVersionsCentrally Condition="'$(ManagePackageVersionsCentrally)' == '' and !$(_GlacierRelProjDir.Contains('\scratch\'))">true</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(_RootPackagesPropsLoaded)' != 'true'">
+    <PackageVersion Include="Glacier.Formats" Version="1.0.1" />
+    <PackageVersion Include="Glacier.Inference" Version="1.10.1" />
+    <PackageVersion Include="Glacier.Polaris" Version="1.2.6" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
+    <PackageVersion Include="System.IO.Hashing" Version="10.0.13" />
+    <PackageVersion Include="System.Numerics.Tensors" Version="10.0.12" />
+    <PackageVersion Include="System.Security.Cryptography.Pkcs" Version="10.0.14" />
+    <PackageVersion Include="coverlet.collector" Version="10.0.1" />
+    <PackageVersion Include="xunit" Version="2.9.3" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
+  </ItemGroup>
+</Project>

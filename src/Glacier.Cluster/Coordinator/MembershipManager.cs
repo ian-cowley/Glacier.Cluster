@@ -164,17 +164,21 @@ public sealed class MembershipManager : IDisposable
     }
 
     /// <summary>
-    /// Records a received heartbeat ping, updating load metrics and failure history.
+    /// Records a received heartbeat ping, updating load metrics and failure history using the coordinator's local receipt clock.
     /// </summary>
-    public void RecordHeartbeat(HeartbeatPingMessage ping)
+    public void RecordHeartbeat(HeartbeatPingMessage ping, ulong receiptTimestampNs = 0)
     {
+        ulong arrivalNs = receiptTimestampNs != 0
+            ? receiptTimestampNs
+            : PhiAccrualFailureDetector.GetCurrentTimestampNs();
+
         if (_nodes.TryGetValue(ping.NodeId, out var node))
         {
-            node.LastHeartbeatTimestampNs = ping.TimestampNs;
+            node.LastHeartbeatTimestampNs = arrivalNs;
             node.ActiveTaskCount = ping.ActiveTaskCount;
             node.CpuUsagePercentage = ping.CpuUsagePercentage;
             node.AvailablePhysicalMemoryBytes = ping.AvailablePhysicalMemoryBytes;
-            _failureDetector.RecordHeartbeat(ping.NodeId, ping.TimestampNs);
+            _failureDetector.RecordHeartbeat(ping.NodeId, arrivalNs);
         }
     }
 

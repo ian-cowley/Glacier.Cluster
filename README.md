@@ -37,7 +37,7 @@
 - **$\Phi$-Accrual Failure Detector**: Continuously adapts to network jitter and latency fluctuations via normal distribution CDF estimation, ensuring rapid detection of hung nodes without spurious false-positive evictions.
 
 ### 3. P2P Arrow IPC Shuffle & Memory Management
-- **100% First-Party Arrow IPC**: Direct integration with `Glacier.Storage.Arrow` and `Glacier.Polaris`—strictly zero dependency on third-party libraries like `Apache.Arrow`.
+- **100% First-Party Arrow IPC**: Direct integration with `Glacier.Formats` and `Glacier.Polaris`—strictly zero dependency on third-party libraries like `Apache.Arrow`.
 - **Atomic Reference-Counted Partition Buffers**: Unmanaged, 64-byte SIMD-aligned native buffers with lock-free atomic CAS retain/release lifecycles.
 - **Credit-Based Flow Control**: Sliding window credit tokens prevent downstream network buffer bloat and OOM conditions during wide-stage shuffles.
 - **Out-of-Core NVMe Disk Spilling**: Automated memory pressure relief seamlessly offloads least-recently-accessed partition buffers to high-speed NVMe storage.
@@ -135,7 +135,7 @@ Console.WriteLine($"Aggregated results: {result.RowCount} rows.");
 
 ## 🧪 Testing & Verification
 
-The test suite contains **490 rigorous tests** covering protocol framing, adversarial serialization, dynamic DAG scheduling, physical TCP worker handshakes, shuffle streaming, ring collectives, fault injection, and end-to-end integration:
+The test suite contains **850 rigorous tests** covering protocol framing, adversarial serialization, dynamic DAG scheduling, physical TCP worker handshakes, shuffle streaming, ring collectives, fault injection, and end-to-end integration:
 
 ```bash
 dotnet test tests/Glacier.Cluster.Tests/Glacier.Cluster.Tests.csproj -c Release
@@ -155,9 +155,9 @@ dotnet build Glacier.Cluster.slnx -c Release
 
 All cluster node join handshakes enforce constant-time token verification (`CryptographicOperations.FixedTimeEquals`) when `ClusterSecret` is configured, alongside strict Zero Secrets policies. No API keys, passwords, or connection credentials are stored in code or configuration files.
 
-Verified clean by automated AST security scanners:
+Verified clean by automated AST security scanners (`glacier security-check` / `scripts/security_check.py`):
 ```bash
-python scripts/security_check.py Glacier.Cluster
+glacier security-check Glacier.Cluster
 ```
 
 ---

@@ -23,7 +23,7 @@ using Xunit;
 /// - Feature 21: Output Logit Numerical Accuracy Suite (FP16 error &lt; 10^-3, INT8 cos sim &gt; 0.9995 &amp; error &lt; 10^-3, FP8 cos sim &gt; 0.9990, multi-layer distributed forward pass logit drift and argmax invariance).
 /// - Feature 22: Automated E2E Cluster Benchmark Harness Verification (prefill &gt; 35-50+ tok/s, decode &gt; 19.5-22+ tok/s, TTFT, LAN latency &lt; 1.0 ms, VRAM &gt;= 2.10 GB free).
 /// - Feature 23: Zero GC Allocations Verifier (0 Gen 0/1/2 collections across 256 continuous hot decode steps, 0 bytes managed heap allocation).
-/// - Feature 24: Zero Secrets Security Audit Verification (python scripts/security_check.py . passes with 0 findings).
+/// - Feature 24: Zero Secrets Security Audit Verification (glacier security-check / scripts/security_check.py passes with 0 findings).
 /// - Feature 25: Comprehensive Technical Report Verification (DEC_HETEROGENEOUS_INFERENCE_REPORT.md).
 /// </summary>
 [CollectionDefinition("SequentialGovernance", DisableParallelization = true)]
@@ -516,9 +516,7 @@ public class Milestone5GovernanceTests
     [Fact]
     public void Feature24_SecurityCheckScript_Exists_AndExecutesCleanly()
     {
-        string? distributedRoot = FindAncestorContaining("src", "Glacier.Cluster")
-            ?? FindAncestorContaining("Glacier.Cluster")
-            ?? FindAncestorContaining("Glacier.Inference.Distributed.slnx");
+        string? distributedRoot = ResolveClusterRepoRoot();
         Assert.NotNull(distributedRoot);
 
         int scannedFiles = 0;
@@ -586,17 +584,66 @@ public class Milestone5GovernanceTests
         Assert.Contains("2.82 GB", content);
     }
 
+    private static string GetThisSourceFilePath([System.Runtime.CompilerServices.CallerFilePath] string path = "") => path;
+
+    private static string? GetCallerDirectory()
+    {
+        string callerPath = GetThisSourceFilePath();
+        if (!string.IsNullOrWhiteSpace(callerPath) && File.Exists(callerPath))
+        {
+            return Path.GetDirectoryName(callerPath);
+        }
+        return null;
+    }
+
+    private static bool IsClusterRepoRoot(string candidate)
+    {
+        return File.Exists(Path.Combine(candidate, "Glacier.Cluster.slnx")) ||
+               File.Exists(Path.Combine(candidate, "src", "Glacier.Cluster", "Glacier.Cluster.csproj"));
+    }
+
+    private static string? ResolveClusterRepoRoot()
+    {
+        foreach (string? startDir in new[] { AppContext.BaseDirectory, Directory.GetCurrentDirectory(), GetCallerDirectory() })
+        {
+            var dir = !string.IsNullOrWhiteSpace(startDir) && Directory.Exists(startDir)
+                ? new DirectoryInfo(startDir)
+                : null;
+            while (dir != null)
+            {
+                if (IsClusterRepoRoot(dir.FullName))
+                {
+                    return dir.FullName;
+                }
+
+                string sub = Path.Combine(dir.FullName, "Glacier.Cluster");
+                if (Directory.Exists(sub) && IsClusterRepoRoot(sub))
+                {
+                    return sub;
+                }
+
+                dir = dir.Parent;
+            }
+        }
+        return null;
+    }
+
     private static string? FindAncestorContaining(params string[] relativeSegments)
     {
-        var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        while (dir != null)
+        foreach (string? startDir in new[] { AppContext.BaseDirectory, Directory.GetCurrentDirectory(), GetCallerDirectory() })
         {
-            string candidate = Path.Combine([dir.FullName, .. relativeSegments]);
-            if (File.Exists(candidate) || Directory.Exists(candidate))
+            var dir = !string.IsNullOrWhiteSpace(startDir) && Directory.Exists(startDir)
+                ? new DirectoryInfo(startDir)
+                : null;
+            while (dir != null)
             {
-                return dir.FullName;
+                string candidate = Path.Combine([dir.FullName, .. relativeSegments]);
+                if (File.Exists(candidate) || Directory.Exists(candidate))
+                {
+                    return dir.FullName;
+                }
+                dir = dir.Parent;
             }
-            dir = dir.Parent;
         }
         return null;
     }

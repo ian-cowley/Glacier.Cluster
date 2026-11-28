@@ -399,6 +399,7 @@ public static class FusedSocketTransport
 
         if (targetBuffer.Length < CombinedHeaderSize)
         {
+            DrainPayload(socket, targetBuffer, checked((int)clusterHeader.PayloadLength));
             resultHeader = default;
             payloadSpan = ReadOnlySpan<byte>.Empty;
             return false;
@@ -419,6 +420,7 @@ public static class FusedSocketTransport
         {
             if (targetBuffer.Length < CombinedHeaderSize + payloadLen)
             {
+                DrainPayload(socket, targetBuffer, payloadLen);
                 payloadSpan = ReadOnlySpan<byte>.Empty;
                 return false;
             }

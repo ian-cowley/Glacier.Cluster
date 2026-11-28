@@ -587,6 +587,8 @@ public sealed class DistributedClusterSession : IDisposable
         {
             await ReadExactAsync(stream, respHdrBytes, 0, ClusterFrameHeader.HeaderSize, ct).ConfigureAwait(false);
             var respHdr = MemoryMarshal.Read<ClusterFrameHeader>(respHdrBytes);
+            if (respHdr.Magic != ClusterFrameHeader.MagicConstant)
+                throw new InvalidDataException($"Remote worker sent invalid frame magic: 0x{respHdr.Magic:X8}.");
             if (respHdr.PayloadLength > FusedSocketTransport.MaxAllowedPayloadBytes)
                 throw new InvalidDataException($"Remote worker sent oversized control frame ({respHdr.PayloadLength} bytes).");
 
@@ -660,6 +662,8 @@ public sealed class DistributedClusterSession : IDisposable
                 {
                     await ReadExactAsync(s, _frameHdrScratch, ackBufOffset, ClusterFrameHeader.HeaderSize, ct).ConfigureAwait(false);
                     var ackHdr = MemoryMarshal.Read<ClusterFrameHeader>(_frameHdrScratch.AsSpan(ackBufOffset, ClusterFrameHeader.HeaderSize));
+                    if (ackHdr.Magic != ClusterFrameHeader.MagicConstant)
+                        throw new InvalidDataException($"Invalid frame magic during ResetKvCache ack: 0x{ackHdr.Magic:X8}.");
                     if (ackHdr.PayloadLength > FusedSocketTransport.MaxAllowedPayloadBytes)
                         throw new InvalidDataException($"Oversized frame during ResetKvCache ack: {ackHdr.PayloadLength}.");
 
@@ -1257,6 +1261,8 @@ public sealed class DistributedClusterSession : IDisposable
         {
             await ReadExactAsync(stream, hdrBytes, 0, ClusterFrameHeader.HeaderSize, ct).ConfigureAwait(false);
             hdr = MemoryMarshal.Read<ClusterFrameHeader>(hdrBytes.AsSpan(0, ClusterFrameHeader.HeaderSize));
+            if (hdr.Magic != ClusterFrameHeader.MagicConstant)
+                throw new InvalidDataException($"Remote worker returned invalid frame magic: 0x{hdr.Magic:X8}.");
             if (hdr.PayloadLength > FusedSocketTransport.MaxAllowedPayloadBytes)
                 throw new InvalidDataException($"Remote worker returned oversized MsgResult payload ({hdr.PayloadLength} bytes).");
 
@@ -1416,6 +1422,8 @@ public sealed class DistributedClusterSession : IDisposable
         {
             await ReadExactAsync(stream, hdrBytes, 0, ClusterFrameHeader.HeaderSize, ct).ConfigureAwait(false);
             clusterHdr = MemoryMarshal.Read<ClusterFrameHeader>(hdrBytes.AsSpan(0, ClusterFrameHeader.HeaderSize));
+            if (clusterHdr.Magic != ClusterFrameHeader.MagicConstant)
+                throw new InvalidDataException($"Remote worker returned invalid batch frame magic: 0x{clusterHdr.Magic:X8}.");
             if (clusterHdr.PayloadLength > FusedSocketTransport.MaxAllowedPayloadBytes)
                 throw new InvalidDataException($"Remote worker returned oversized MsgResultBatch payload ({clusterHdr.PayloadLength} bytes).");
 
@@ -1525,7 +1533,10 @@ public sealed class DistributedClusterSession : IDisposable
                 Streams[s].Write(_frameHdrScratch, 0, ClusterFrameHeader.HeaderSize);
                 Streams[s].Flush();
             }
-            catch { }
+            catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[DistributedClusterSession] Shutdown frame warning on stream {s}: {ex.Message}");
+            }
             finally
             {
                 Streams[s].Dispose();
