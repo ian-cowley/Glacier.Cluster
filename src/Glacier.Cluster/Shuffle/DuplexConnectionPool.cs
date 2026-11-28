@@ -9,6 +9,7 @@ using System.IO.Pipelines;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -78,6 +79,7 @@ public sealed class DuplexConnection : IAsyncDisposable, IDisposable
     private readonly AsyncLocal<bool> _inInternalLoop = new();
     private Task? _readLoopTask;
     private Task? _unsolicitedDispatchTask;
+    private Exception? _fatalException;
     private int _isDisposed;
 
     public Guid RemoteNodeId => _remoteNodeId;
@@ -208,9 +210,19 @@ public sealed class DuplexConnection : IAsyncDisposable, IDisposable
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
+            if (tcs.Task.IsFaulted && tcs.Task.Exception?.InnerException is { } fault)
+            {
+                ExceptionDispatchInfo.Capture(fault).Throw();
+            }
+
             if (timeoutCts.IsCancellationRequested)
             {
                 throw new TimeoutException($"Request with CorrelationId {correlationId} to node {_remoteNodeId} timed out after {timeout.TotalMilliseconds}ms.");
+            }
+
+            if (Volatile.Read(ref _fatalException) is { } fatal)
+            {
+                throw new IOException($"Connection to peer {_remoteNodeId} closed unexpectedly.", fatal);
             }
 
             throw new IOException($"Connection to peer {_remoteNodeId} closed before response for CorrelationId {correlationId} was received.");
@@ -293,6 +305,8 @@ public sealed class DuplexConnection : IAsyncDisposable, IDisposable
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            Interlocked.CompareExchange(ref _fatalException, ex, null);
+
             // Fault all pending requests with IOException
             foreach (var kvp in _pendingRequests)
             {

@@ -272,6 +272,41 @@ public sealed class HardeningM35Tests
     }
 
     [Fact]
+    public async Task Item2_DuplexConnection_Crc32Corruption_AlwaysPreservesInvalidDataInnerException()
+    {
+        byte[] frameBytes = new byte[ClusterFrameHeader.HeaderSize + 128];
+        int packedLen = ClusterMessageSerializer.PackFrame(
+            new HeartbeatPongMessage(Guid.NewGuid(), 0UL, 1UL, 0u, 1u),
+            correlationId: 1,
+            flags: ClusterFrameFlags.None,
+            frameBytes);
+        frameBytes[ClusterFrameHeader.HeaderSize] ^= 0xFF;
+
+        for (int iter = 0; iter < 50; iter++)
+        {
+            var pipeIn = new Pipe();
+            var pipeOut = new Pipe();
+            await using var conn = new DuplexConnection(Guid.NewGuid(), new PairDuplexPipe(pipeIn.Reader, pipeOut.Writer));
+            conn.Start();
+
+            Task sendTask = conn.SendRequestAsync(
+                new HeartbeatPingMessage(Guid.NewGuid(), 1UL, 0, 0f, 0UL),
+                correlationId: 1,
+                TimeSpan.FromSeconds(2)).AsTask();
+
+            ReadResult outgoing = await pipeOut.Reader.ReadAsync();
+            pipeOut.Reader.AdvanceTo(outgoing.Buffer.End);
+
+            await pipeIn.Writer.WriteAsync(frameBytes.AsMemory(0, packedLen));
+            await pipeIn.Writer.FlushAsync();
+
+            var ex = await Assert.ThrowsAsync<IOException>(() => sendTask);
+            Assert.IsType<InvalidDataException>(ex.InnerException);
+            await pipeIn.Writer.CompleteAsync();
+        }
+    }
+
+    [Fact]
     public async Task Item2_RingAllReduceWorker_ValidatesCtorAndCorruptHeaders()
     {
         var prevPipe = new Pipe();
