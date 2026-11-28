@@ -70,7 +70,13 @@ public sealed class ClusterSimulatorOptions
     public TimeSpan WorkerHeartbeatInterval { get; set; } = TimeSpan.FromMilliseconds(100);
 
     /// <summary>Coordinator heartbeat audit check interval.</summary>
-    public TimeSpan CoordinatorHeartbeatAuditInterval { get; set; } = TimeSpan.FromMilliseconds(100);
+    public TimeSpan CoordinatorHeartbeatAuditInterval { get; set; } = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>
+    /// Minimum standard deviation (in ms) for Phi-Accrual failure detection under ThreadPool jitter.
+    /// Prevents transient CI/load scheduling delays from triggering false worker evictions.
+    /// </summary>
+    public double FailureDetectorMinStdDevMs { get; set; } = 250.0;
 
     /// <summary>Chunk size for WirePipes shuffle streaming.</summary>
     public uint ShuffleChunkSizeBytes { get; set; } = 65536;
@@ -79,6 +85,7 @@ public sealed class ClusterSimulatorOptions
     public ClusterCoordinatorOptions CoordinatorOptions { get; set; } = new()
     {
         Port = 0, // In-process only, no TCP listen
-        HeartbeatAuditInterval = TimeSpan.FromMilliseconds(100)
+        DisableSocketListener = true,
+        HeartbeatAuditInterval = TimeSpan.FromMilliseconds(250)
     };
 }

@@ -71,7 +71,12 @@ public sealed class ClusterSimulator : IAsyncDisposable, IDisposable
         if (_isRunning) return;
 
         // 1. Initialize and start ClusterCoordinator
-        _coordinator = new ClusterCoordinator(_options.CoordinatorOptions);
+        var failureDetector = new PhiAccrualFailureDetector(
+            suspectThreshold: 8.0,
+            evictionThreshold: 12.0,
+            minStdDevMs: _options.FailureDetectorMinStdDevMs);
+        var membership = new MembershipManager(failureDetector);
+        _coordinator = new ClusterCoordinator(_options.CoordinatorOptions, membershipManager: membership);
         await _coordinator.StartAsync(cancellationToken).ConfigureAwait(false);
 
         // 2. Initialize and boot virtual worker nodes

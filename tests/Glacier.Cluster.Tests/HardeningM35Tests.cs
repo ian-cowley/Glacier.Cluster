@@ -307,6 +307,22 @@ public sealed class HardeningM35Tests
     }
 
     [Fact]
+    public async Task ClusterSimulator_DefaultsAndTransientJitter_KeepWorkersHealthy()
+    {
+        var opts = new ClusterSimulatorOptions();
+        Assert.True(opts.CoordinatorOptions.DisableSocketListener);
+        Assert.True(opts.FailureDetectorMinStdDevMs >= 250.0);
+
+        await using var simulator = await ClusterSimulator.CreateAsync(nodeCount: 4);
+        Assert.Equal(4, simulator.Coordinator.Membership.ActiveNodeCount);
+
+        await Task.Delay(300);
+
+        var healthyProfiles = simulator.Coordinator.Membership.GetHealthyHardwareProfiles();
+        Assert.Equal(4, healthyProfiles.Count);
+    }
+
+    [Fact]
     public async Task Item2_RingAllReduceWorker_ValidatesCtorAndCorruptHeaders()
     {
         var prevPipe = new Pipe();

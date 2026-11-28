@@ -15,7 +15,7 @@
     <!-- NuGet Package Metadata -->
     <PackageId>Glacier.Cluster</PackageId>
     <Version>1.3.6</Version>
-    <PackageReleaseNotes>v1.3.6: Preserve fatal ReadLoop inner exceptions during DuplexConnection concurrent close and cancel races.</PackageReleaseNotes>
+    <PackageReleaseNotes>v1.3.6: Preserve fatal ReadLoop inner exceptions on cancel races and harden ClusterSimulator failure-detector minStdDev and socket defaults.</PackageReleaseNotes>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
     <Description>Pure C# .NET 10 distributed computing fabric, dynamic DAG scheduler, zero-allocation Pipelines wire protocol, multiplexed P2P Arrow IPC shuffle bus, and heterogeneous hardware task placement.</Description>
