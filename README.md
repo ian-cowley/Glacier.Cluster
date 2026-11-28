@@ -1,97 +1,32 @@
 ![Glacier.Cluster Banner](assets/banner.jpg)
 
-# 🌐 Glacier.Cluster: Distributed Compute Fabric & Dynamic DAG Scheduler
+# Glacier.Cluster
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![.NET 10](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/)
 [![AOT Compatible](https://img.shields.io/badge/Native%20AOT-IsAotCompatible-success.svg)](https://learn.microsoft.com/en-us/dotnet/core/deploying/native-aot/)
-[![Zero Secrets](https://img.shields.io/badge/Security-Zero%20Secrets%20Audited-brightgreen.svg)](AGENTS.md)
 [![Website](https://img.shields.io/badge/Website-glaciersoftware.dev-66fcf1.svg)](https://glaciersoftware.dev/)
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Support-orange.svg?logo=buy-me-a-coffee)](https://buymeacoffee.com/glaciersoftware)
 
-**Pillar 15** of the **Glacier High-Performance .NET 10 Data Science & Scientific Computing Ecosystem**.
+`Glacier.Cluster` is a distributed compute runtime, DAG scheduler, and multi-node pipeline library for .NET 10. It connects worker processes over `System.IO.Pipelines` framing to run distributed `Glacier.Polaris` queries, Ring AllReduce collectives, and multi-stage model inference.
 
-`Glacier.Cluster` provides an ultra-low latency, zero-copy distributed compute engine and dynamic DAG scheduler designed for heterogeneous clusters. It unifies CPU SIMD vector units (AVX-512, AVX2, ARM Neon) and GPU accelerators (NVIDIA CUDA, AMD ROCm/Vulkan, Apple Metal) across bare-metal networks, delivering enterprise-grade distributed columnar dataframe queries, distributed ML training, and high-throughput Ring AllReduce collectives.
+It targets distributed .NET services that need typed binary protocols, Arrow IPC partition shuffles, failure detection, and in-memory multi-node fault simulation under Native AOT without JVM or C++ runtime dependencies.
 
----
+## Install
 
-## 🏛️ Architectural Overview
+```powershell
+dotnet add package Glacier.Cluster
+```
 
-<p align="center">
-  <img src="assets/architecture.jpg" alt="Glacier.Cluster Architecture Blueprint" width="100%" />
-</p>
-
----
-
-## ⚡ Key Capabilities
-
-### 1. Zero-Allocation Wire Engine & Binary Framing
-- **Strict 32-Byte 64-Bit Aligned Frame Headers**: Every network frame starts with a fixed-size header (`0x47434C55` / `"GCLU"` magic, protocol version, message type, flags, payload length, 32-bit CRC32, and 64-bit correlation ID).
-- **`System.IO.Pipelines` Zero-Copy Parsing**: Socket data flows directly through high-performance `PipeReader` without intermediate GC buffer allocations.
-- **Hardware Profile Probing**: Direct OS-level detection of CPU logical cores, SIMD instruction sets (AVX-512, AVX2, Neon), total system RAM, and GPU accelerator capabilities (CUDA, Direct3D12, Vulkan, Metal).
-
-### 2. Two-Phase DAG Scheduler & Partition Routing
-- **Hardware-Aware Task Placement**: Phase 1 applies hard capability filtering (GPU vendor, memory thresholds); Phase 2 computes soft affinity scores based on SIMD tier, memory headroom, and pending queue depth.
-- **Vectorized Lemire Fast Reduction Hash Routing**: Low-overhead partition placement powered by XXHash3 and branchless Lemire reductions:
-  $$\text{Partition}(k) = \frac{(\text{XXHash3}(k) \times M)}{2^{64}}$$
-- **$\Phi$-Accrual Failure Detector**: Continuously adapts to network jitter and latency fluctuations via normal distribution CDF estimation, ensuring rapid detection of hung nodes without spurious false-positive evictions.
-
-### 3. P2P Arrow IPC Shuffle & Memory Management
-- **100% First-Party Arrow IPC**: Direct integration with `Glacier.Formats` and `Glacier.Polaris`—strictly zero dependency on third-party libraries like `Apache.Arrow`.
-- **Atomic Reference-Counted Partition Buffers**: Unmanaged, 64-byte SIMD-aligned native buffers with lock-free atomic CAS retain/release lifecycles.
-- **Credit-Based Flow Control**: Sliding window credit tokens prevent downstream network buffer bloat and OOM conditions during wide-stage shuffles.
-- **Out-of-Core NVMe Disk Spilling**: Automated memory pressure relief seamlessly offloads least-recently-accessed partition buffers to high-speed NVMe storage.
-
-### 4. Distributed Collectives & High-Level APIs
-- **Ring AllReduce Collective Engine**: Scatter-reduce followed by allgather across directed virtual or physical rings, achieving optimal bus bandwidth:
-  $$\text{Bus Bandwidth} = \frac{2(N - 1)}{N} \cdot \frac{S}{T}$$
-- **Distributed DataFrame (`DistributedDataFrame`)**: Immutable logical plan trees supporting distributed `Filter`, `Select`, `GroupBy`, `Join`, `Repartition`, and genuine Apache Parquet (`WriteParquetAsync`) & Arrow IPC (`WriteArrowIpcAsync`) sinks.
-- **Distributed K-Means (`DistributedKMeans`)**: Scalable, multi-node clustering with distributed centroid updates and convergence tracking.
-
-### 5. Virtual Cluster Simulator & Fault Injection
-- **4-to-64 Node Simulation**: Deterministic in-memory simulation engine for multi-node topology testing, task scheduling validation, and shuffle data exchange.
-- **Chaos Fault Injection**: Programmable dropped frames, injected latency, node crashes, network partition splits, and disk spill saturation testing.
-
----
-
-## 📊 Physical Fleet Verification & Benchmark Metrics
-
-The Glacier.Cluster engine has been empirically verified across 4 physical bare-metal hardware nodes (76 logical cores, 208 GB RAM, 77.8 GB GPU VRAM / UMA):
-
-### 1. Physical P2P Arrow IPC Network Streaming (LAN)
-Partitions containing 500,000 Int64 rows streamed over physical network connections:
-
-| Client Machine | Target Server | Transferred Payload | Physical Throughput | Partition Latency |
-| :--- | :--- | :--- | :--- | :--- |
-| **Host Laptop** (`192.168.1.111`) | Fedora Linux (`192.168.1.200:51002`) | 20 partitions (76.29 MB) | **11.24 MB/s** | **339.40 ms** |
-| **Beast** (`192.168.1.108`) | Fedora Linux (`192.168.1.200:51002`) | 10 partitions (38.15 MB) | **11.24 MB/s** | **339.31 ms** |
-| **MinisForum64** (`192.168.1.101`) | Fedora Linux (`192.168.1.200:51002`) | 10 partitions (38.15 MB) | **11.24 MB/s** | **339.29 ms** |
-
-### 2. Distributed DataFrame Query Pipeline Execution
-Distributed query pipeline (`Filter` $\rightarrow$ `Select` $\rightarrow$ `GroupBy.Sum`) over **1,000,000 rows across 8 partitions**:
-
-| Physical Node | Processor Architecture | Execution Time | Throughput | Mathematical Parity |
-| :--- | :--- | :--- | :--- | :---: |
-| **Host Laptop** | AMD Ryzen AI 9 HX 370 (Zen 5, AVX-512) | **245.64 ms** | **4.07 Million rows/sec** | 🟢 Exact Match |
-| **MinisForum64** | AMD Ryzen 9 6900HX (Zen 3+, AVX2) | **314.15 ms** | **3.18 Million rows/sec** | 🟢 Exact Match |
-| **Fedora Linux** | AMD Ryzen AI 9 HX 370 (Zen 5, AVX-512) | **375.27 ms** | **2.66 Million rows/sec** | 🟢 Exact Match |
-| **Beast** | AMD Ryzen 5 5500 (Zen 3, AVX2) | **390.69 ms** | **2.56 Million rows/sec** | 🟢 Exact Match |
-
----
-
-## 🚀 Quickstart
-
-### 1. Launching a Coordinator and Worker
+## Quick Start
 
 ```csharp
 using System.Net;
 using Glacier.Cluster.Coordinator;
+using Glacier.Cluster.Polaris;
 using Glacier.Cluster.Worker;
 
-// Load shared cluster secret strictly from environment variables
 string clusterSecret = Environment.GetEnvironmentVariable("GLACIER_CLUSTER_SECRET") ?? string.Empty;
 
-// Start Coordinator
 await using var coordinator = new ClusterCoordinator(new ClusterCoordinatorOptions
 {
     BindAddress = IPAddress.Loopback,
@@ -100,7 +35,6 @@ await using var coordinator = new ClusterCoordinator(new ClusterCoordinatorOptio
 });
 await coordinator.StartAsync();
 
-// Start Worker Node
 await using var worker = new ClusterWorker(new ClusterWorkerOptions
 {
     CoordinatorEndPoint = new IPEndPoint(IPAddress.Loopback, 51000),
@@ -108,77 +42,37 @@ await using var worker = new ClusterWorker(new ClusterWorkerOptions
     ClusterSecret = clusterSecret
 });
 await worker.StartAsync();
-```
 
-### 2. Distributed DataFrame Query Execution
-
-```csharp
-using Glacier.Cluster.Polaris;
-using Glacier.Polaris;
-
-// Create distributed dataframe partitioned across cluster nodes
-var partitions = LoadClusterPartitions();
+// Execute a distributed query plan across registered worker partitions:
 using var ddf = DistributedDataFrameFactory.FromPartitions(partitions);
-
-// Build and execute distributed pipeline
-var result = await ddf
+var summary = await ddf
     .Filter("age > 30")
     .Select("dept", "salary")
     .GroupBy("dept")
     .Sum("salary")
     .CollectAsync();
-
-Console.WriteLine($"Aggregated results: {result.RowCount} rows.");
 ```
 
----
+## What You Can Do
 
-## 🧪 Testing & Verification
+- **Coordinate worker nodes (`ClusterCoordinator` & `ClusterWorker`):** Authenticate joins with constant-time SHA-256 `ClusterSecret` comparison, probe worker CPU/SIMD/GPU capabilities (`NodeHardwareProfile.ProbeLocal`), and track liveness via `PhiAccrualFailureDetector`.
+- **Schedule hardware-aware DAGs (`TwoPhaseScheduler` & `StageCompiler`):** Filter nodes by memory and accelerator capability, score affinity across queue depth and SIMD tier, and hash-route partitions with XXHash3 Lemire reduction.
+- **Shuffle Arrow IPC partitions (`ArrowShuffleServer` & `ArrowShuffleClient`):** Stream `Glacier.Formats` / `Glacier.Polaris` batches across workers with 64-byte aligned reference-counted buffers, credit-based flow control, and `DiskSpillManager`.
+- **Run distributed queries & collectives (`DistributedDataFrame`, `DistributedKMeans`, `RingAllReduceCoordinator`):** Run `Filter`, `Select`, `GroupBy`, `Join`, `Repartition`, K-Means fitting, and ring scatter-reduce / allgather across physical sockets or the in-memory `ClusterSimulator`.
+- **Pipeline inference across nodes (`DistributedPipelineCoordinator` & `DistributedClusterSession`):** Balance transformer layers across heterogeneous GPUs and warm CPU expert pools (`ClusterResourcePlanner`, `HeterogeneousLoadBalancer`, `SpeculativeOverlapCoordinator`).
 
-The test suite contains **850 rigorous tests** covering protocol framing, adversarial serialization, dynamic DAG scheduling, physical TCP worker handshakes, shuffle streaming, ring collectives, fault injection, and end-to-end integration:
+## Platform & Compatibility
 
-```bash
-dotnet test tests/Glacier.Cluster.Tests/Glacier.Cluster.Tests.csproj -c Release
-```
+`Glacier.Cluster` targets `.NET 10` (`net10.0`) with `<IsAotCompatible>true</IsAotCompatible>`, `<EnableTrimAnalyzer>true</EnableTrimAnalyzer>`, and source-generated `ClusterJsonContext`.
 
-### Native AOT & Trim Analyzer Readiness
+## Documentation
 
-`Glacier.Cluster` enables `<IsAotCompatible>true</IsAotCompatible>`, `<EnableTrimAnalyzer>true</EnableTrimAnalyzer>`, and `<TreatWarningsAsErrors>true</TreatWarningsAsErrors>` across its wire framing, scheduling, consensus, and P2P Arrow IPC shuffle planes:
+- [User Manual](docs/manual.md) — Coordinator/worker setup, scheduler, Arrow IPC shuffle, `DistributedDataFrame`, Ring AllReduce, and `ClusterSimulator`
+- [Distributed Inference Manual](docs/manual/distributed-inference.md) — Stage workers, heterogeneous load balancing, dynamic calibration, and speculative pipeline execution
+- [Architecture](docs/architecture.md) — `GCLU` wire framing, two-phase scheduling, active-standby ledger, failure detection, and shuffle memory model
 
-```bash
-dotnet build Glacier.Cluster.slnx -c Release
-```
+## License & Credits
 
----
+Licensed under the [MIT License](LICENSE).
 
-## 🔒 Security & Zero Secrets Policy
-
-All cluster node join handshakes enforce constant-time token verification (`CryptographicOperations.FixedTimeEquals`) when `ClusterSecret` is configured, alongside strict Zero Secrets policies. No API keys, passwords, or connection credentials are stored in code or configuration files.
-
-Verified clean by automated AST security scanners (`glacier security-check` / `scripts/security_check.py`):
-```bash
-glacier security-check Glacier.Cluster
-```
-
----
-
-## Credits
-
-Developed by **Ian Cowley** and **Antigravity (Google DeepMind)**.
-
----
-
-## 📄 License
-
-Licensed under the [MIT License](LICENSE). Copyright (c) 2026 Ian Cowley.
-
----
-
-## ❄️ Glacier Ecosystem & Support
-
-Part of the **[Glacier Ecosystem](https://glaciersoftware.dev/)** — high-performance, zero-allocation developer tooling and data engines natively built for modern C# and .NET 10.
-
-* 🌐 **Website & Documentation**: [glaciersoftware.dev](https://glaciersoftware.dev/)
-* ☕ **Buy Me a Coffee**: [buymeacoffee.com/glaciersoftware](https://buymeacoffee.com/glaciersoftware)
-* ❤️ **GitHub Sponsors**: [github.com/sponsors/ian-cowley](https://github.com/sponsors/ian-cowley)
-* 🐙 **All Repositories**: [github.com/ian-cowley](https://github.com/ian-cowley)
+Developed by Ian Cowley, Antigravity (Google DeepMind) and Claude.
